@@ -44,6 +44,27 @@ from notifier import FeishuNotifier, load_webhook_from_config
 ROOT = Path(__file__).resolve().parent
 SESSIONS_DIR = ROOT / "sessions"
 DEFAULT_CONFIG = str(ROOT / "config.json")
+REGISTRY = ROOT / "registry.json"
+
+# 按 job id 自动发现 all_config.json 时搜索的根目录 (可在 config.json 里用 search_roots 覆盖)
+DEFAULT_SEARCH_ROOTS = [
+    "/user/hongchenye/train_output/ckpt",
+    "/user/hongchenye/train_output",
+    "/backup/user/hongchenye/train/ckpt",
+]
+
+# 监控参数默认值 (add/set 未显式指定时使用)
+OPTION_DEFAULTS = {
+    "interval": 120,
+    "report_interval": 3600,
+    "stall": 1200,
+    "startup_grace": 3600,
+    "use_ct": False,
+    "ct_cmd": "ct",
+    "workspace": None,
+    "keep_alive": False,
+    "webhook": None,
+}
 
 
 # ----------------------------- 工具函数 -----------------------------
@@ -526,6 +547,134 @@ def monitor(args: argparse.Namespace) -> None:
         time.sleep(args.interval)
 
 
+# ----------------------------- 自动发现 & 注册表 -----------------------------
+
+def get_search_roots(config_file: str = DEFAULT_CONFIG) -> list:
+    if config_file and os.path.exists(config_file):
+        try:
+            roots = json.load(open(config_file, encoding="utf-8")).get("search_roots")
+            if roots:
+                return list(roots)
+        except Exception:
+            pass
+    return list(DEFAULT_SEARCH_ROOTS)
+
+
+def _iter_config_paths(roots: list):
+    """在若干根目录下按有限深度查找 all_config.json (避免深挖 ckpt 分片目录)。"""
+    seen = set()
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        for depth in range(1, 7):
+            pat = os.path.join(r, *(["*"] * depth), "all_config.json")
+            for p in glob.glob(pat):
+                if p not in seen:
+                    seen.add(p)
+                    yield p
+
+
+def discover_config_by_job_id(job_id: str, roots: list) -> Optional[str]:
+    """根据 job id 找到对应的 all_config.json; 多个匹配取启动时间最新的。"""
+    cands = []
+    for p in _iter_config_paths(roots):
+        try:
+            ta = json.load(open(p, encoding="utf-8")).get("training_args", {})
+        except Exception:
+            continue
+        tb = ta.get("tensorboard") or ""
+        if f"job_{job_id}" in tb or f"job_{job_id}" in p:
+            start = parse_start_ts_from_path(tb) or os.path.getmtime(p)
+            cands.append((start, p))
+    if not cands:
+        return None
+    cands.sort(reverse=True)
+    return cands[0][1]
+
+
+def load_registry() -> dict:
+    return load_json(REGISTRY, {})
+
+
+def save_registry(d: dict) -> None:
+    save_json(REGISTRY, d)
+
+
+def session_dir_for(name: str) -> Path:
+    return SESSIONS_DIR / safe_name(name)
+
+
+def read_pid(session_dir: Path) -> Optional[str]:
+    p = session_dir / "pid"
+    return p.read_text().strip() if p.exists() else None
+
+
+def is_alive(session_dir: Path) -> bool:
+    pid = read_pid(session_dir)
+    return bool(pid and pid.isdigit() and os.path.exists(f"/proc/{pid}"))
+
+
+def stop_session(session_dir: Path) -> bool:
+    pid = read_pid(session_dir)
+    if pid and pid.isdigit():
+        try:
+            os.kill(int(pid), 15)
+            return True
+        except ProcessLookupError:
+            return False
+    return False
+
+
+# ----------------------------- 启动后台监控 -----------------------------
+
+def spawn_watchdog(name: str, launch: dict) -> int:
+    """根据 launch 配置字典后台拉起一个 run 进程, 返回 pid。"""
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    session_dir = session_dir_for(name)
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    opts = {**OPTION_DEFAULTS, **launch.get("options", {})}
+    cmd = [sys.executable, str(Path(__file__).resolve()), "run",
+           "--session-dir", str(session_dir),
+           "--name", safe_name(name),
+           "--interval", str(opts["interval"]),
+           "--report-interval", str(opts["report_interval"]),
+           "--stall", str(opts["stall"]),
+           "--startup-grace", str(opts["startup_grace"]),
+           "--ct-cmd", str(opts["ct_cmd"]),
+           "--config-file", launch.get("config_file", DEFAULT_CONFIG)]
+    if launch.get("config"):
+        cmd += ["--config", launch["config"]]
+    if launch.get("tb_dir"):
+        cmd += ["--tb-dir", launch["tb_dir"]]
+    if launch.get("ckpt_dir"):
+        cmd += ["--ckpt-dir", launch["ckpt_dir"]]
+    if launch.get("max_steps"):
+        cmd += ["--max-steps", str(launch["max_steps"])]
+    if launch.get("job_id"):
+        cmd += ["--job-id", str(launch["job_id"])]
+    if opts.get("webhook"):
+        cmd += ["--webhook", opts["webhook"]]
+    if opts.get("use_ct"):
+        cmd += ["--use-ct"]
+    if opts.get("workspace"):
+        cmd += ["--workspace", opts["workspace"]]
+    if opts.get("keep_alive"):
+        cmd += ["--keep-alive"]
+
+    out = (session_dir / "watchdog.stdout").open("a", encoding="utf-8")
+    proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    (session_dir / "pid").write_text(str(proc.pid), encoding="utf-8")
+    return proc.pid
+
+
+def _ns_for_build(config=None, tb_dir=None, ckpt_dir=None, max_steps=None,
+                  job_id=None, name=None) -> argparse.Namespace:
+    return argparse.Namespace(config=config, tb_dir=tb_dir, ckpt_dir=ckpt_dir,
+                              max_steps=max_steps, job_id=job_id, name=name)
+
+
 # ----------------------------- CLI 子命令 -----------------------------
 
 def _add_common_run_args(p: argparse.ArgumentParser) -> None:
@@ -547,96 +696,219 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--keep-alive", action="store_true", help="终态后不退出, 继续记录")
 
 
-def cmd_start(args: argparse.Namespace) -> None:
-    rc = build_run_config(args)  # 提前校验配置
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    session_name = safe_name(args.name or rc.name)
-    session_dir = SESSIONS_DIR / session_name
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-    # 转发参数给后台 run
-    cmd = [sys.executable, str(Path(__file__).resolve()), "run",
-           "--session-dir", str(session_dir),
-           "--interval", str(args.interval),
-           "--report-interval", str(args.report_interval),
-           "--stall", str(args.stall),
-           "--startup-grace", str(args.startup_grace),
-           "--ct-cmd", args.ct_cmd,
-           "--config-file", args.config_file]
-    if args.config:
-        cmd += ["--config", args.config]
-    if args.tb_dir:
-        cmd += ["--tb-dir", args.tb_dir]
-    if args.ckpt_dir:
-        cmd += ["--ckpt-dir", args.ckpt_dir]
-    if args.max_steps:
-        cmd += ["--max-steps", str(args.max_steps)]
-    if args.job_id:
-        cmd += ["--job-id", args.job_id]
-    cmd += ["--name", session_name]
-    if args.webhook:
-        cmd += ["--webhook", args.webhook]
-    if args.use_ct:
-        cmd += ["--use-ct"]
-    if args.workspace:
-        cmd += ["--workspace", args.workspace]
-    if args.keep_alive:
-        cmd += ["--keep-alive"]
-
-    if args.foreground:
-        args.session_dir = str(session_dir)
-        monitor(args)
-        return
-
-    out = (session_dir / "watchdog.stdout").open("a", encoding="utf-8")
-    proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-    (session_dir / "pid").write_text(str(proc.pid), encoding="utf-8")
-    print(f"已后台启动 watchdog: pid={proc.pid}")
-    print(f"session 目录: {session_dir}")
-    print(f"实时状态文档: {session_dir / 'status.md'}")
-    print(f"日志: {session_dir / 'watchdog.log'}")
+def _options_from_args(args: argparse.Namespace) -> dict:
+    """把命令行里显式给出的监控参数收集成 options (只收非默认/显式项)。"""
+    opts = {}
+    for key in ("interval", "report_interval", "stall", "startup_grace",
+                "use_ct", "ct_cmd", "workspace", "keep_alive", "webhook"):
+        val = getattr(args, key, None)
+        if val is not None:
+            opts[key] = val
+    return opts
 
 
-def cmd_status(args: argparse.Namespace) -> None:
-    if not SESSIONS_DIR.exists():
-        print("暂无 session。")
-        return
-    for session in sorted(SESSIONS_DIR.glob("*")):
-        if not session.is_dir():
+def cmd_add(args: argparse.Namespace) -> None:
+    """核心命令: watchdog add <job_id> —— 自动发现配置并启动监控, 登记到监控表。"""
+    reg = load_registry()
+    roots = get_search_roots(args.config_file)
+    cli_opts = _options_from_args(args)
+
+    for job_id in args.job_ids:
+        job_id = str(job_id)
+        config = args.config
+        tb_dir = args.tb_dir
+        max_steps = args.max_steps
+        ckpt_dir = args.ckpt_dir
+
+        if not config and not tb_dir:
+            config = discover_config_by_job_id(job_id, roots)
+            if not config:
+                print(f"[{job_id}] 未能自动定位 all_config.json。")
+                print("  可手动指定: --config <all_config.json> 或 --tb-dir <dir> --max-steps <N>")
+                print(f"  (搜索根目录: {roots})")
+                continue
+            print(f"[{job_id}] 已自动定位配置: {config}")
+
+        # 校验并抽取 tb_dir / max_steps / name
+        try:
+            rc = build_run_config(_ns_for_build(config=config, tb_dir=tb_dir,
+                                                ckpt_dir=ckpt_dir, max_steps=max_steps,
+                                                job_id=job_id, name=args.name))
+        except SystemExit as e:
+            print(f"[{job_id}] 配置无效: {e}")
             continue
-        st = load_json(session / "state.json", {})
-        pid_file = session / "pid"
-        pid = pid_file.read_text().strip() if pid_file.exists() else "?"
-        alive = "?"
-        if pid.isdigit():
-            alive = "alive" if os.path.exists(f"/proc/{pid}") else "dead"
+
+        name = safe_name(args.name or rc.name or f"job_{job_id}")
+        sdir = session_dir_for(name)
+        if name in reg and is_alive(sdir):
+            print(f"[{job_id}] 已在监控中 (session={name}, pid={read_pid(sdir)})。"
+                  f" 如需改参数用: watchdog set {job_id} ...")
+            continue
+
+        options = {**OPTION_DEFAULTS, **cli_opts}
+        launch = {
+            "job_id": job_id,
+            "config": config,
+            "tb_dir": rc.tb_dir,
+            "ckpt_dir": rc.ckpt_dir,
+            "max_steps": rc.max_steps,
+            "options": options,
+            "config_file": args.config_file,
+        }
+        if args.no_start:
+            reg[name] = {**launch, "name": name, "session_dir": str(sdir),
+                         "added_at": now_str(), "started": False}
+            save_registry(reg)
+            print(f"[{job_id}] 已登记 (未启动)。用 watchdog restart {job_id} 启动。")
+            continue
+
+        pid = spawn_watchdog(name, launch)
+        reg[name] = {**launch, "name": name, "session_dir": str(sdir),
+                     "added_at": now_str(), "started": True}
+        save_registry(reg)
+        print(f"[{job_id}] 已启动监控: session={name} pid={pid} "
+              f"step_total={rc.max_steps}")
+        print(f"         状态文档: {sdir / 'status.md'}")
+
+
+def _find_entry(reg: dict, key: str):
+    """按 job_id 或 session 名找注册项, 返回 (name, entry) 或 (None, None)。"""
+    key = str(key)
+    if key in reg:
+        return key, reg[key]
+    for name, e in reg.items():
+        if str(e.get("job_id")) == key:
+            return name, e
+    # 允许用 safe_name 后的名字
+    sk = safe_name(key)
+    if sk in reg:
+        return sk, reg[sk]
+    return None, None
+
+
+def cmd_rm(args: argparse.Namespace) -> None:
+    reg = load_registry()
+    for key in args.job_ids:
+        name, entry = _find_entry(reg, key)
+        if not entry:
+            print(f"[{key}] 不在监控表中。")
+            continue
+        sdir = session_dir_for(name)
+        if is_alive(sdir):
+            stop_session(sdir)
+            print(f"[{key}] 已停止 (pid={read_pid(sdir)})。")
+        reg.pop(name, None)
+        save_registry(reg)
+        if args.purge and sdir.exists():
+            shutil.rmtree(sdir, ignore_errors=True)
+            print(f"[{key}] 已删除 session 目录。")
+        print(f"[{key}] 已从监控表移除。")
+
+
+def cmd_ls(args: argparse.Namespace) -> None:
+    reg = load_registry()
+    if not reg:
+        print("监控表为空。用  watchdog add <job_id>  添加。")
+        return
+    header = f"{'JOB':<8} {'NAME':<22} {'PID':<8} {'ALIVE':<6} {'STATUS':<10} {'STEP':<12} {'PCT':<7} {'ETA':<12} LAST"
+    print(header)
+    print("-" * len(header))
+    for name, e in reg.items():
+        sdir = session_dir_for(name)
+        st = load_json(sdir / "state.json", {})
+        pid = read_pid(sdir) or "-"
+        alive = "yes" if is_alive(sdir) else "no"
+        status = st.get("last_status", "-")
         step = st.get("step")
+        step_s = f"{step}/{e.get('max_steps','?')}" if step is not None else "-"
         pct = st.get("pct")
         pct_s = f"{pct*100:.1f}%" if isinstance(pct, (int, float)) else "-"
-        print(f"{session.name}\tpid={pid}({alive})\tstatus={st.get('last_status')}\t"
-              f"step={step}\tpct={pct_s}\tlast={st.get('last_checked_at')}")
+        eta = st.get("eta_sec")
+        eta_s = fmt_duration(eta) if isinstance(eta, (int, float)) else "-"
+        last = st.get("last_checked_at", "-")
+        print(f"{str(e.get('job_id','-')):<8} {name:<22} {pid:<8} {alive:<6} "
+              f"{status:<10} {step_s:<12} {pct_s:<7} {eta_s:<12} {last}")
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    reg = load_registry()
+    name, entry = _find_entry(reg, args.job_id)
+    if not entry:
+        print(f"[{args.job_id}] 不在监控表中。")
+        return
+    md = session_dir_for(name) / "status.md"
+    if md.exists():
+        print(md.read_text(encoding="utf-8"))
+    else:
+        print(f"[{args.job_id}] 尚无 status.md (可能刚启动)。")
+
+
+def cmd_set(args: argparse.Namespace) -> None:
+    """改监控参数并自动重启该 session。"""
+    reg = load_registry()
+    name, entry = _find_entry(reg, args.job_id)
+    if not entry:
+        print(f"[{args.job_id}] 不在监控表中。先 add。")
+        return
+    changed = _options_from_args(args)
+    if not changed:
+        print("未指定要修改的参数。可改: --interval/--report-interval/--stall/"
+              "--startup-grace/--use-ct/--webhook/--keep-alive 等")
+        return
+    entry.setdefault("options", {}).update(changed)
+    reg[name] = entry
+    save_registry(reg)
+    sdir = session_dir_for(name)
+    if is_alive(sdir):
+        stop_session(sdir)
+        time.sleep(1)
+    pid = spawn_watchdog(name, entry)
+    entry["started"] = True
+    save_registry(reg)
+    print(f"[{args.job_id}] 已更新参数 {changed} 并重启 (pid={pid})。")
+
+
+def cmd_restart(args: argparse.Namespace) -> None:
+    reg = load_registry()
+    keys = args.job_ids or list(reg.keys())
+    for key in keys:
+        name, entry = _find_entry(reg, key)
+        if not entry:
+            print(f"[{key}] 不在监控表中。")
+            continue
+        sdir = session_dir_for(name)
+        if is_alive(sdir):
+            stop_session(sdir)
+            time.sleep(1)
+        pid = spawn_watchdog(name, entry)
+        entry["started"] = True
+        reg[name] = entry
+        save_registry(reg)
+        print(f"[{key}] 已重启 (pid={pid})。")
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
-    session = SESSIONS_DIR / safe_name(args.name)
-    pid_file = session / "pid"
-    if not pid_file.exists():
-        print(f"未找到 session: {args.name}")
-        return
-    pid = pid_file.read_text().strip()
-    if pid.isdigit():
-        try:
-            os.kill(int(pid), 15)
-            print(f"已发送 SIGTERM 给 pid={pid}")
-        except ProcessLookupError:
-            print(f"进程 {pid} 已不存在。")
-    else:
-        print("pid 无效。")
+    reg = load_registry()
+    keys = args.job_ids or list(reg.keys())
+    for key in keys:
+        name, entry = _find_entry(reg, key)
+        # 也允许直接用 session 名停未登记的
+        sdir = session_dir_for(name or key)
+        if not sdir.exists():
+            print(f"[{key}] 未找到对应 session。")
+            continue
+        if stop_session(sdir):
+            print(f"[{key}] 已停止 (pid={read_pid(sdir)})。")
+        else:
+            print(f"[{key}] 进程不存在或已停止。")
 
 
 def cmd_once(args: argparse.Namespace) -> None:
-    """单次检查并打印报告 (可选发一条飞书), 用于调试。"""
+    """单次检查并打印报告 (可选发一条飞书), 用于调试。支持仅给 --job-id 自动发现。"""
+    if args.job_id and not args.config and not args.tb_dir:
+        cfg = discover_config_by_job_id(str(args.job_id), get_search_roots(args.config_file))
+        if cfg:
+            args.config = cfg
     rc = build_run_config(args)
     tailer = TBTailer(tb_dir=rc.tb_dir)
     tailer.poll()
@@ -663,36 +935,76 @@ def cmd_test_notify(args: argparse.Namespace) -> None:
     print("发送成功。" if ok else "发送失败, 请检查 webhook。")
 
 
+def _add_option_args(p: argparse.ArgumentParser) -> None:
+    """add/set 共用的可调监控参数 (默认 None, 表示不覆盖)。"""
+    p.add_argument("--interval", type=int, help="状态检查间隔秒 (默认120)")
+    p.add_argument("--report-interval", type=int, help="正常时进度汇报间隔秒 (默认3600)")
+    p.add_argument("--stall", type=int, help="多久无更新判定卡死(秒) (默认1200)")
+    p.add_argument("--startup-grace", type=int, help="启动宽限期(秒) (默认3600)")
+    p.add_argument("--webhook", help="飞书 webhook")
+    p.add_argument("--use-ct", action="store_true", default=None, help="用 ct 拿权威状态")
+    p.add_argument("--ct-cmd", help="ct 可执行名/路径")
+    p.add_argument("--workspace", help="ct 执行工作目录")
+    p.add_argument("--keep-alive", action="store_true", default=None, help="终态后不退出")
+    p.add_argument("--config-file", default=DEFAULT_CONFIG, help="含 feishu_webhook/search_roots 的配置")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="训练任务 watchdog (状态告警 + 进度汇报 + 飞书通知)")
+    parser = argparse.ArgumentParser(description="训练任务 watchdog (监控表: add/rm/ls/set + 飞书告警/进度)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_start = sub.add_parser("start", help="后台启动一个 watchdog")
-    _add_common_run_args(p_start)
-    p_start.add_argument("--foreground", action="store_true", help="前台运行(调试)")
-    p_start.set_defaults(func=cmd_start)
+    # ---- 监控表核心命令 ----
+    p_add = sub.add_parser("add", help="添加 job 到监控表并启动 (只需 job id)")
+    p_add.add_argument("job_ids", nargs="+", help="一个或多个 job id")
+    p_add.add_argument("--config", help="手动指定 all_config.json (跳过自动发现)")
+    p_add.add_argument("--tb-dir", help="手动指定 TB 目录")
+    p_add.add_argument("--ckpt-dir", help="手动指定 exp_ckpt_dir")
+    p_add.add_argument("--max-steps", type=int, help="手动指定总步数")
+    p_add.add_argument("--name", help="自定义 session 名 (缺省 job_<id>)")
+    p_add.add_argument("--no-start", action="store_true", help="只登记不启动")
+    _add_option_args(p_add)
+    p_add.set_defaults(func=cmd_add)
 
-    p_run = sub.add_parser("run", help="(内部)前台运行监控循环")
-    _add_common_run_args(p_run)
-    p_run.add_argument("--session-dir", required=True)
-    p_run.set_defaults(func=monitor)
+    p_rm = sub.add_parser("rm", help="从监控表移除 (并停止)")
+    p_rm.add_argument("job_ids", nargs="+")
+    p_rm.add_argument("--purge", action="store_true", help="同时删除 session 目录")
+    p_rm.set_defaults(func=cmd_rm)
 
-    p_once = sub.add_parser("once", help="单次检查并打印报告")
-    _add_common_run_args(p_once)
-    p_once.add_argument("--send", action="store_true", help="同时发一条飞书")
-    p_once.set_defaults(func=cmd_once)
+    p_ls = sub.add_parser("ls", help="查看监控表 (状态/进度)")
+    p_ls.set_defaults(func=cmd_ls)
 
-    p_status = sub.add_parser("status", help="列出所有 session")
-    p_status.set_defaults(func=cmd_status)
+    p_show = sub.add_parser("show", help="查看某 job 的详细状态快照")
+    p_show.add_argument("job_id")
+    p_show.set_defaults(func=cmd_show)
 
-    p_stop = sub.add_parser("stop", help="停止某个 session")
-    p_stop.add_argument("name")
+    p_set = sub.add_parser("set", help="修改某 job 的监控参数并重启")
+    p_set.add_argument("job_id")
+    _add_option_args(p_set)
+    p_set.set_defaults(func=cmd_set)
+
+    p_restart = sub.add_parser("restart", help="重启监控 (缺省全部)")
+    p_restart.add_argument("job_ids", nargs="*")
+    p_restart.set_defaults(func=cmd_restart)
+
+    p_stop = sub.add_parser("stop", help="停止监控 (缺省全部)")
+    p_stop.add_argument("job_ids", nargs="*")
     p_stop.set_defaults(func=cmd_stop)
 
     p_test = sub.add_parser("test-notify", help="发送一条飞书测试消息")
     p_test.add_argument("--webhook")
     p_test.add_argument("--config-file", default=DEFAULT_CONFIG)
     p_test.set_defaults(func=cmd_test_notify)
+
+    # ---- 底层/调试命令 ----
+    p_run = sub.add_parser("run", help="(内部)前台运行监控循环")
+    _add_common_run_args(p_run)
+    p_run.add_argument("--session-dir", required=True)
+    p_run.set_defaults(func=monitor)
+
+    p_once = sub.add_parser("once", help="单次检查并打印报告 (支持仅 --job-id)")
+    _add_common_run_args(p_once)
+    p_once.add_argument("--send", action="store_true", help="同时发一条飞书")
+    p_once.set_defaults(func=cmd_once)
 
     args = parser.parse_args()
     args.func(args)

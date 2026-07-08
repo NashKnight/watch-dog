@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""训练任务 watchdog: 监控 Cybertron 训练 job 的状态与进度, 自动发飞书。
+"""训练/任务 watchdog: 一个常驻守护进程读取"监控表", 监控每个 job 的状态与进度, 自动发飞书。
 
-核心能力 (对应需求):
-  1. 状态异常 (卡死无进度 / Failed / Killed) -> 立即发红色告警卡片。
-  2. 状态正常时, 每隔一段时间汇报进度: 百分比 / 当前阶段 / 已运行时长 / 预计剩余。
-  3. 同时把快照写到 session 目录的 status.md, 方便直接看文档。
+模型 (符合"一个开关 + 一张监控表"):
+  - 监控表 = 纯文本 ``watchlist.txt``, 每行一个 job:  ``<job_id> <任务名>`` (名字可选)。
+  - 守护进程 = 一个进程 (``start`` 开 / ``stop`` 关), 每轮重读监控表, 逐个 job 评估并按需播报。
+  - 增删查改都只认 job id:  ``add`` / ``rm`` / ``ls`` / ``show``。
 
-数据来源 (登录/notebook 节点即可访问的共享盘):
-  - TensorBoard event 文件 (增量解析): 当前 step / loss / wall_time -> 进度、速度、ETA、是否卡死。
-  - checkpoint 目录: 已存出的 ckpt (确认进度里程碑)。
-  - 可选 `ct job get <id>`: 若本机有 ct, 用它拿权威状态 (Failed/Killed)。
+数据来源 (登录/notebook 节点即可, 不必登训练节点):
+  - 训练任务: TensorBoard event 文件 -> step/loss/进度/速度/ETA;  GPU 卡数取自 all_config.json 的 world_size。
+  - 通用任务(带日志路径): 日志文件新鲜度 + 可选 X/Y 进度。
+  - 可选 ``ct``: 本机若有 ct, 用它拿任意任务的权威状态 + CPU/GPU/内存/起止时间 (自动点亮)。
 
-推荐用法:
-  python watchdog.py start --config <exp_ckpt_dir>/all_config.json --name my_run
+设计上用统一的 ``JobReport`` (字段全部可选) 承载不同任务类型, 谁能填就填, 渲染时跳过未知字段 —— 方便扩展。
 """
 
 from __future__ import annotations
@@ -27,14 +26,13 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 from tb_reader import (
     TBTailer,
-    find_latest_event_file,
     parse_job_id_from_path,
     parse_start_ts_from_path,
 )
@@ -42,32 +40,33 @@ from notifier import FeishuNotifier, load_webhook_from_config
 
 
 ROOT = Path(__file__).resolve().parent
-SESSIONS_DIR = ROOT / "sessions"
-DEFAULT_CONFIG = str(ROOT / "config.json")
-REGISTRY = ROOT / "registry.json"
+CONFIG_FILE = ROOT / "config.json"
+WATCHLIST = ROOT / "watchlist.txt"
+EXTRA_FILE = ROOT / "jobs_extra.json"      # 每个 job 的高级配置 (日志路径/类型覆盖)
+STATE_DIR = ROOT / "state"                 # 每个 job 的通知/进度状态
+PIDFILE = ROOT / "watchdog.pid"
+LOGFILE = ROOT / "watchdog.log"
+EVENTS = ROOT / "events.jsonl"
+STATUS_MD = ROOT / "status.md"             # 全表快照文档
 
-# 按 job id 自动发现 all_config.json 时搜索的根目录 (可在 config.json 里用 search_roots 覆盖)
 DEFAULT_SEARCH_ROOTS = [
     "/user/hongchenye/train_output/ckpt",
     "/user/hongchenye/train_output",
     "/backup/user/hongchenye/train/ckpt",
 ]
 
-# 监控参数默认值 (add/set 未显式指定时使用)
-OPTION_DEFAULTS = {
-    "interval": 120,
-    "report_interval": 3600,
-    "stall": 1200,
-    "startup_grace": 3600,
+DEFAULTS = {
+    "interval": 120,            # 状态检查间隔(秒)
+    "report_interval": 600,     # 正常时进度播报间隔(秒)
+    "stall": 1200,              # 多久无更新判定卡死(秒)
+    "startup_grace": 3600,      # 启动宽限期(秒)
     "use_ct": False,
     "ct_cmd": "ct",
     "workspace": None,
-    "keep_alive": False,
-    "webhook": None,
 }
 
 
-# ----------------------------- 工具函数 -----------------------------
+# ----------------------------- 基础工具 -----------------------------
 
 def now_ts() -> float:
     return time.time()
@@ -77,12 +76,35 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def safe_name(text: str) -> str:
-    return re.sub(r"[^0-9A-Za-z_.-]+", "_", text).strip("_")[:120] or "run"
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def append_jsonl(path: Path, data: dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def log_line(msg: str) -> None:
+    line = f"[{now_str()}] {msg}"
+    with LOGFILE.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 def fmt_duration(seconds: Optional[float]) -> str:
-    if seconds is None or seconds < 0 or math.isinf(seconds) or math.isnan(seconds):
+    if seconds is None or (isinstance(seconds, float) and (math.isinf(seconds) or math.isnan(seconds))) or seconds < 0:
         return "未知"
     seconds = int(seconds)
     d, rem = divmod(seconds, 86400)
@@ -106,462 +128,72 @@ def progress_bar(pct: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    cfg["search_roots"] = list(DEFAULT_SEARCH_ROOTS)
+    cfg["feishu_webhook"] = None
+    file_cfg = load_json(CONFIG_FILE, {})
+    for k, v in file_cfg.items():
+        cfg[k] = v
+    return cfg
 
 
-def save_json(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+# ----------------------------- 监控表 (watchlist.txt) -----------------------------
 
-
-def append_jsonl(path: Path, data: dict) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(data, ensure_ascii=False) + "\n")
-
-
-# ----------------------------- 运行配置 -----------------------------
-
-@dataclass
-class RunConfig:
-    name: str
-    tb_dir: str
-    max_steps: int
-    ckpt_dir: Optional[str] = None
-    warmup_t: int = 0
-    t_initial: int = 0
-    save_step: int = 0
-    prefix: str = ""
-    world_size: int = 0
-    epochs: int = 0
-    job_id: Optional[str] = None
-    start_ts: Optional[float] = None
-
-
-def _read_all_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def build_run_config(args: argparse.Namespace) -> RunConfig:
-    """从 --config all_config.json 或显式参数构造 RunConfig。"""
-    tb_dir = args.tb_dir
-    max_steps = args.max_steps
-    ckpt_dir = args.ckpt_dir
-    warmup_t = t_initial = save_step = world_size = epochs = 0
-    prefix = ""
-
-    config_path = args.config
-    # 允许 --ckpt-dir 指向 exp_ckpt_dir, 自动找里面的 all_config.json
-    if not config_path and ckpt_dir:
-        cand = os.path.join(ckpt_dir, "all_config.json")
-        if os.path.exists(cand):
-            config_path = cand
-
-    if config_path and os.path.exists(config_path):
-        cfg = _read_all_config(config_path)
-        ta = cfg.get("training_args", cfg)
-        tb_dir = tb_dir or ta.get("tensorboard")
-        max_steps = max_steps or ta.get("max_steps")
-        ckpt_dir = ckpt_dir or ta.get("exp_ckpt_dir")
-        warmup_t = ta.get("warmup_t", 0)
-        t_initial = ta.get("t_initial", 0)
-        save_step = ta.get("save_step", 0)
-        prefix = ta.get("prefix", "")
-        world_size = ta.get("world_size", 0)
-        epochs = ta.get("epochs", 0)
-
-    if not tb_dir:
-        raise SystemExit("错误: 无法确定 TensorBoard 目录, 请用 --config 或 --tb-dir 指定。")
-    if not max_steps:
-        raise SystemExit("错误: 无法确定 max_steps, 请用 --config 或 --max-steps 指定。")
-
-    job_id = args.job_id or parse_job_id_from_path(tb_dir)
-    start_ts = parse_start_ts_from_path(tb_dir)
-    name = args.name or (f"job_{job_id}" if job_id else safe_name(prefix or "run"))
-
-    return RunConfig(
-        name=name,
-        tb_dir=tb_dir,
-        max_steps=int(max_steps),
-        ckpt_dir=ckpt_dir,
-        warmup_t=int(warmup_t or 0),
-        t_initial=int(t_initial or 0),
-        save_step=int(save_step or 0),
-        prefix=prefix,
-        world_size=int(world_size or 0),
-        epochs=int(epochs or 0),
-        job_id=job_id,
-        start_ts=start_ts,
-    )
-
-
-# ----------------------------- 指标 & 状态 -----------------------------
-
-@dataclass
-class Metrics:
-    have_data: bool
-    step: int
-    max_steps: int
-    pct: float
-    steps_per_sec: Optional[float]
-    sec_per_step: Optional[float]
-    elapsed_sec: Optional[float]
-    eta_sec: Optional[float]
-    finish_at: Optional[str]
-    phase: str
-    next_save_step: Optional[int]
-    losses: dict
-    freshness_sec: Optional[float]
-    latest_ckpt_step: Optional[int]
-
-
-def latest_ckpt_step(rc: RunConfig) -> Optional[int]:
-    if not rc.ckpt_dir or not os.path.isdir(rc.ckpt_dir):
-        return None
-    steps = []
-    for p in glob.glob(os.path.join(rc.ckpt_dir, "job_*_ckpt_*")):
-        m = re.search(r"_ckpt_(\d+)$", p)
-        if m:
-            steps.append(int(m.group(1)))
-    for p in glob.glob(os.path.join(rc.ckpt_dir, "global_step*")):
-        m = re.search(r"global_step(\d+)$", p)
-        if m:
-            steps.append(int(m.group(1)))
-    return max(steps) if steps else None
-
-
-def build_metrics(rc: RunConfig, tailer: TBTailer, now: float) -> Metrics:
-    have_data = tailer.latest_step >= 0
-    step = max(tailer.latest_step, 0)
-    pct = (step / rc.max_steps) if rc.max_steps else 0.0
-
-    sps = tailer.steps_per_sec()
-    spstep = (1.0 / sps) if sps else None
-    eta_sec = ((rc.max_steps - step) / sps) if (sps and step < rc.max_steps) else (0.0 if step >= rc.max_steps else None)
-    finish_at = None
-    if eta_sec is not None:
-        finish_at = (datetime.now() + timedelta(seconds=eta_sec)).strftime("%m-%d %H:%M")
-
-    elapsed = (now - rc.start_ts) if rc.start_ts else None
-
-    if rc.warmup_t and step <= rc.warmup_t:
-        phase = f"warmup 预热 ({step}/{rc.warmup_t})"
-    else:
-        phase = "正式训练"
-
-    next_save = None
-    if rc.save_step and step < rc.max_steps:
-        next_save = ((step // rc.save_step) + 1) * rc.save_step
-        next_save = min(next_save, rc.max_steps)
-
-    mtime = tailer.event_file_mtime()
-    fresh = (now - mtime) if mtime else (now - tailer.latest_wall if tailer.latest_wall else None)
-
-    return Metrics(
-        have_data=have_data,
-        step=step,
-        max_steps=rc.max_steps,
-        pct=pct,
-        steps_per_sec=sps,
-        sec_per_step=spstep,
-        elapsed_sec=elapsed,
-        eta_sec=eta_sec,
-        finish_at=finish_at,
-        phase=phase,
-        next_save_step=next_save,
-        losses=dict(tailer.losses),
-        freshness_sec=fresh,
-        latest_ckpt_step=latest_ckpt_step(rc),
-    )
-
-
-# 状态常量
-S_WARMUP = "WarmingUp"     # 还没有任何 TB 数据 (进程刚起/加载中)
-S_RUNNING = "Running"
-S_STALLED = "Stalled"       # 有数据但长时间无进度 -> 疑似卡死/被杀
-S_FAILED = "Failed"         # ct 报告 Failed
-S_KILLED = "Killed"         # ct 报告 Killed
-S_COMPLETED = "Completed"
-
-ABNORMAL = {S_STALLED, S_FAILED, S_KILLED}
-
-
-def ct_status(job_id: str, ct_cmd: str, workspace: Optional[str]) -> Optional[str]:
-    """尽力用 ct 拿权威状态; ct 不可用时返回 None (不报错)。"""
-    exe = shutil.which(ct_cmd) or (ct_cmd if os.path.exists(ct_cmd) else None)
-    if not exe:
-        return None
-    try:
-        proc = subprocess.run(
-            [exe, "--fields", "id,status", "job", "get", str(job_id)],
-            cwd=workspace or None,
-            text=True,
-            capture_output=True,
-            timeout=60,
-        )
-        if proc.returncode != 0:
-            return None
-        data = json.loads(proc.stdout).get("data", {})
-        return data.get("status")
-    except Exception:
-        return None
-
-
-def determine_status(
-    metrics: Metrics,
-    rc: RunConfig,
-    now: float,
-    stall_sec: int,
-    startup_grace_sec: int,
-    ct_state: Optional[str],
-) -> str:
-    # ct 权威状态优先 (若可用)
-    if ct_state in ("Failed",):
-        return S_FAILED
-    if ct_state in ("Killed",):
-        return S_KILLED
-    if ct_state in ("Succeeded",) or metrics.step >= rc.max_steps and metrics.have_data:
-        return S_COMPLETED
-
-    if not metrics.have_data:
-        # 还没有 TB 数据: 启动宽限期内算预热, 超过且文件也不更新则疑似卡死
-        age = (now - rc.start_ts) if rc.start_ts else 0
-        if age > startup_grace_sec and (metrics.freshness_sec or 0) > stall_sec:
-            return S_STALLED
-        return S_WARMUP
-
-    if (metrics.freshness_sec or 0) > stall_sec:
-        return S_STALLED
-    return S_RUNNING
-
-
-# ----------------------------- 消息渲染 -----------------------------
-
-def render_card(rc: RunConfig, m: Metrics, status: str, extra: str = "") -> str:
-    lines = []
-    head = {
-        S_WARMUP: "任务启动中 (加载/编译, 暂无进度数据)",
-        S_RUNNING: "训练进行中",
-        S_STALLED: "长时间无进度更新, 疑似卡死/被杀",
-        S_FAILED: "任务 Failed",
-        S_KILLED: "任务 Killed",
-        S_COMPLETED: "训练已完成",
-    }.get(status, status)
-    lines.append(f"**状态**: {status} — {head}")
-    ident = rc.prefix or rc.name
-    lines.append(f"**实验**: {ident}")
-    if rc.job_id:
-        lines.append(f"**Job**: {rc.job_id}" + (f"  |  **卡数**: {rc.world_size}" if rc.world_size else ""))
-
-    if m.have_data:
-        lines.append(
-            f"**进度**: {m.step}/{m.max_steps}  ({m.pct*100:.1f}%)\n`{progress_bar(m.pct)}`"
-        )
-        lines.append(f"**阶段**: {m.phase}")
-        if m.next_save_step:
-            lines.append(f"**下次存 ckpt**: step {m.next_save_step}"
-                         + (f" (已存到 {m.latest_ckpt_step})" if m.latest_ckpt_step else ""))
-        if m.sec_per_step:
-            sph = 3600.0 / m.sec_per_step
-            lines.append(f"**速度**: {m.sec_per_step:.1f} 秒/step  (~{sph:.0f} step/小时)")
-        lines.append(f"**已运行**: {fmt_duration(m.elapsed_sec)}")
-        if status not in (S_COMPLETED,):
-            lines.append(f"**预计剩余**: {fmt_duration(m.eta_sec)}"
-                         + (f"  (约 {m.finish_at} 完成)" if m.finish_at else ""))
-        if m.losses:
-            loss_str = "  ".join(
-                f"{k.split('/')[-1]}={v:.3f}" for k, v in m.losses.items()
-            )
-            lines.append(f"**Loss**: {loss_str}")
-    else:
-        lines.append(f"**已运行**: {fmt_duration(m.elapsed_sec)} (尚未产出训练步)")
-
-    if m.freshness_sec is not None:
-        lines.append(f"**TB 最近更新**: {fmt_duration(m.freshness_sec)}前")
-    lines.append(f"**检查时间**: {now_str()}")
-    if extra:
-        lines.append(extra)
-    return "\n".join(lines)
-
-
-def level_for(status: str) -> str:
-    if status in (S_FAILED, S_KILLED, S_STALLED):
-        return "alert"
-    if status == S_COMPLETED:
-        return "ok"
-    return "info"
-
-
-def write_status_md(path: Path, rc: RunConfig, m: Metrics, status: str) -> None:
-    content = "# Watchdog 状态快照\n\n" + render_card(rc, m, status).replace("**", "**") + "\n"
-    path.write_text(content, encoding="utf-8")
-
-
-# ----------------------------- 监控主循环 -----------------------------
-
-def monitor(args: argparse.Namespace) -> None:
-    rc = build_run_config(args)
-    session_dir = Path(args.session_dir)
-    session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "pid").write_text(str(os.getpid()), encoding="utf-8")
-
-    log_path = session_dir / "watchdog.log"
-    state_path = session_dir / "state.json"
-    events_path = session_dir / "events.jsonl"
-    status_md = session_dir / "status.md"
-
-    def log(msg: str) -> None:
-        line = f"[{now_str()}] {msg}"
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
-    webhook = args.webhook or load_webhook_from_config(args.config_file) or None
-    notifier = FeishuNotifier(webhook=webhook, logger=log)
-
-    tailer = TBTailer(tb_dir=rc.tb_dir)
-
-    state = load_json(state_path, {})
-    state.update({
-        "name": rc.name,
-        "job_id": rc.job_id,
-        "prefix": rc.prefix,
-        "tb_dir": rc.tb_dir,
-        "ckpt_dir": rc.ckpt_dir,
-        "max_steps": rc.max_steps,
-        "created_at": state.get("created_at", now_str()),
-    })
-    started_notified = state.get("started_notified", False)
-    last_report_ts = state.get("last_report_ts", 0)
-    incident = state.get("incident")  # 当前未恢复的异常状态
-    completed_notified = state.get("completed_notified", False)
-    save_json(state_path, state)
-
-    log(f"watchdog 启动 pid={os.getpid()} job={rc.job_id} tb_dir={rc.tb_dir}")
-    log(f"参数: interval={args.interval}s report={args.report_interval}s "
-        f"stall={args.stall}s startup_grace={args.startup_grace}s notify={'on' if notifier.enabled else 'off'}")
-
-    while True:
-        now = now_ts()
-        try:
-            tailer.poll()
-        except Exception as e:  # noqa: BLE001
-            log(f"读取 TB 失败: {e}")
-
-        ct_state = None
-        if args.use_ct and rc.job_id:
-            ct_state = ct_status(rc.job_id, args.ct_cmd, args.workspace)
-
-        m = build_metrics(rc, tailer, now)
-        status = determine_status(m, rc, now, args.stall, args.startup_grace, ct_state)
-
-        # 落盘
-        state.update({
-            "last_status": status,
-            "last_checked_at": now_str(),
-            "step": m.step,
-            "pct": round(m.pct, 4),
-            "sec_per_step": m.sec_per_step,
-            "eta_sec": m.eta_sec,
-            "freshness_sec": m.freshness_sec,
-            "losses": m.losses,
-            "ct_state": ct_state,
-        })
-        append_jsonl(events_path, {
-            "time": now_str(), "status": status, "step": m.step,
-            "pct": round(m.pct, 4), "freshness_sec": m.freshness_sec, "ct_state": ct_state,
-        })
-        try:
-            write_status_md(status_md, rc, m, status)
-        except Exception as e:  # noqa: BLE001
-            log(f"写 status.md 失败: {e}")
-        log(f"status={status} step={m.step}/{m.max_steps} pct={m.pct*100:.1f}% "
-            f"fresh={fmt_duration(m.freshness_sec)} ct={ct_state}")
-
-        # ---- 通知状态机 ----
-        if not started_notified:
-            notifier.send(f"🚀 Watchdog 已启动 · {rc.prefix or rc.name}",
-                          render_card(rc, m, status), level="info")
-            started_notified = True
-            last_report_ts = now
-
-        # 完成
-        if status == S_COMPLETED:
-            if not completed_notified:
-                notifier.send(f"✅ 训练完成 · {rc.prefix or rc.name}",
-                              render_card(rc, m, S_COMPLETED), level="ok")
-                completed_notified = True
-                log("训练完成。")
-            state.update({"started_notified": started_notified, "last_report_ts": last_report_ts,
-                          "incident": None, "completed_notified": completed_notified})
-            save_json(state_path, state)
-            if not args.keep_alive:
-                return
-            time.sleep(args.interval)
+def read_watchlist() -> list:
+    """返回 [(job_id, name), ...]。行格式: ``<job_id> <name...>``, # 开头为注释。"""
+    entries = []
+    if not WATCHLIST.exists():
+        return entries
+    for raw in WATCHLIST.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-
-        # 异常: 进入新异常时告警 (同一异常不重复刷屏)
-        if status in ABNORMAL:
-            if incident != status:
-                extra = ""
-                if status == S_STALLED:
-                    extra = ("> ⚠️ TB 日志长时间未更新, 训练可能已卡死或被杀。"
-                             "请人工确认 (查看 job 状态 / 节点)。")
-                notifier.send(f"🚨 任务异常告警 · {rc.prefix or rc.name}",
-                              render_card(rc, m, status, extra), level="alert")
-                incident = status
-                log(f"触发告警: {status}")
-            # Failed/Killed 属终态, 除非 keep-alive 否则退出
-            if status in (S_FAILED, S_KILLED) and not args.keep_alive:
-                state.update({"started_notified": started_notified, "last_report_ts": last_report_ts,
-                              "incident": incident, "completed_notified": completed_notified})
-                save_json(state_path, state)
-                return
-        else:
-            # 恢复: 之前有异常, 现在正常了
-            if incident is not None:
-                notifier.send(f"🟢 已恢复正常 · {rc.prefix or rc.name}",
-                              render_card(rc, m, status,
-                                          "> 训练已重新产生进度, 从之前的异常状态恢复。"),
-                              level="ok")
-                log(f"从 {incident} 恢复到 {status}")
-                incident = None
-                last_report_ts = now
-
-            # 定期进度汇报
-            if status == S_RUNNING and (now - last_report_ts) >= args.report_interval:
-                notifier.send(f"📊 训练进度 · {rc.prefix or rc.name}",
-                              render_card(rc, m, status), level="info")
-                last_report_ts = now
-                log("发送定期进度汇报。")
-
-        state.update({"started_notified": started_notified, "last_report_ts": last_report_ts,
-                      "incident": incident, "completed_notified": completed_notified})
-        save_json(state_path, state)
-        time.sleep(args.interval)
+        parts = line.split(None, 1)
+        job_id = parts[0]
+        name = parts[1].strip() if len(parts) > 1 else ""
+        entries.append((job_id, name))
+    return entries
 
 
-# ----------------------------- 自动发现 & 注册表 -----------------------------
+def write_watchlist(entries: list) -> None:
+    lines = ["# 监控表: 每行 `<job_id> <任务名>` (名字可选)。watchdog 会自动读取。"]
+    for job_id, name in entries:
+        lines.append(f"{job_id} {name}".rstrip())
+    WATCHLIST.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-def get_search_roots(config_file: str = DEFAULT_CONFIG) -> list:
-    if config_file and os.path.exists(config_file):
-        try:
-            roots = json.load(open(config_file, encoding="utf-8")).get("search_roots")
-            if roots:
-                return list(roots)
-        except Exception:
-            pass
-    return list(DEFAULT_SEARCH_ROOTS)
+
+def upsert_entry(job_id: str, name: str) -> None:
+    entries = read_watchlist()
+    out = [(jid, nm) for jid, nm in entries if jid != job_id]
+    out.append((job_id, name))
+    write_watchlist(out)
+
+
+def remove_from_watchlist(job_id: str) -> bool:
+    entries = read_watchlist()
+    out = [(jid, nm) for jid, nm in entries if jid != job_id]
+    if len(out) != len(entries):
+        write_watchlist(out)
+        return True
+    return False
+
+
+def load_extra() -> dict:
+    return load_json(EXTRA_FILE, {})
+
+
+def save_extra(d: dict) -> None:
+    save_json(EXTRA_FILE, d)
+
+
+# ----------------------------- 自动发现配置 -----------------------------
+
+def get_search_roots(cfg: dict) -> list:
+    return cfg.get("search_roots") or list(DEFAULT_SEARCH_ROOTS)
 
 
 def _iter_config_paths(roots: list):
-    """在若干根目录下按有限深度查找 all_config.json (避免深挖 ckpt 分片目录)。"""
     seen = set()
     for r in roots:
         if not os.path.isdir(r):
@@ -575,7 +207,6 @@ def _iter_config_paths(roots: list):
 
 
 def discover_config_by_job_id(job_id: str, roots: list) -> Optional[str]:
-    """根据 job id 找到对应的 all_config.json; 多个匹配取启动时间最新的。"""
     cands = []
     for p in _iter_config_paths(roots):
         try:
@@ -592,419 +223,671 @@ def discover_config_by_job_id(job_id: str, roots: list) -> Optional[str]:
     return cands[0][1]
 
 
-def load_registry() -> dict:
-    return load_json(REGISTRY, {})
+# ----------------------------- ct 平台信息 (可选) -----------------------------
+
+def ct_available(ct_cmd: str) -> bool:
+    return bool(shutil.which(ct_cmd) or (os.path.exists(ct_cmd)))
 
 
-def save_registry(d: dict) -> None:
-    save_json(REGISTRY, d)
+def ct_job_info(job_id: str, ct_cmd: str, workspace: Optional[str]) -> Optional[dict]:
+    """本机若有 ct, 返回权威状态 + 资源信息; 否则 None。"""
+    exe = shutil.which(ct_cmd) or (ct_cmd if os.path.exists(ct_cmd) else None)
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "--fields",
+             "id,status,cpu_num,gpu_num,memory_size,started_at,ended_at,resource_pool,train_type",
+             "job", "get", str(job_id)],
+            cwd=workspace or None, text=True, capture_output=True, timeout=60,
+        )
+        if proc.returncode != 0:
+            return None
+        return json.loads(proc.stdout).get("data", {})
+    except Exception:
+        return None
 
 
-def session_dir_for(name: str) -> Path:
-    return SESSIONS_DIR / safe_name(name)
+# ----------------------------- 统一报告模型 -----------------------------
+
+# 状态常量
+S_WARMUP = "WarmingUp"
+S_RUNNING = "Running"
+S_STALLED = "Stalled"
+S_FAILED = "Failed"
+S_KILLED = "Killed"
+S_COMPLETED = "Completed"
+S_UNKNOWN = "Unknown"
+ABNORMAL = {S_STALLED, S_FAILED, S_KILLED}
+
+STATUS_DESC = {
+    S_WARMUP: "启动中(加载/编译, 暂无进度)",
+    S_RUNNING: "运行中",
+    S_STALLED: "长时间无更新, 疑似卡死/被杀",
+    S_FAILED: "失败 Failed",
+    S_KILLED: "被终止 Killed",
+    S_COMPLETED: "已完成",
+    S_UNKNOWN: "未知(本机无法获取, 需 ct/日志)",
+}
 
 
-def read_pid(session_dir: Path) -> Optional[str]:
-    p = session_dir / "pid"
-    return p.read_text().strip() if p.exists() else None
+@dataclass
+class JobReport:
+    job_id: str
+    name: str
+    kind: str = "unknown"        # training | generic | unknown
+    status: str = S_UNKNOWN
+    # 进度
+    step: Optional[int] = None
+    max_steps: Optional[int] = None
+    pct: Optional[float] = None
+    phase: Optional[str] = None
+    speed_desc: Optional[str] = None
+    eta_sec: Optional[float] = None
+    finish_at: Optional[str] = None
+    next_save_step: Optional[int] = None
+    latest_ckpt_step: Optional[int] = None
+    losses: dict = field(default_factory=dict)
+    # 资源 (多数需 ct)
+    gpu: Optional[Any] = None
+    cpu: Optional[Any] = None
+    mem: Optional[Any] = None
+    pool: Optional[str] = None
+    # 时间
+    start_ts: Optional[float] = None
+    elapsed_sec: Optional[float] = None
+    freshness_sec: Optional[float] = None
+    note: str = ""
 
 
-def is_alive(session_dir: Path) -> bool:
-    pid = read_pid(session_dir)
-    return bool(pid and pid.isdigit() and os.path.exists(f"/proc/{pid}"))
+def _default_name(job_id: str, start_ts: Optional[float]) -> str:
+    if start_ts:
+        return datetime.fromtimestamp(start_ts).strftime("%m%d_%H%M")
+    return f"job_{job_id}"
 
 
-def stop_session(session_dir: Path) -> bool:
-    pid = read_pid(session_dir)
-    if pid and pid.isdigit():
+def latest_ckpt_step(ckpt_dir: Optional[str]) -> Optional[int]:
+    if not ckpt_dir or not os.path.isdir(ckpt_dir):
+        return None
+    steps = []
+    for p in glob.glob(os.path.join(ckpt_dir, "job_*_ckpt_*")) + glob.glob(os.path.join(ckpt_dir, "global_step*")):
+        m = re.search(r"(?:_ckpt_|global_step)(\d+)$", p)
+        if m:
+            steps.append(int(m.group(1)))
+    return max(steps) if steps else None
+
+
+def _determine_training_status(rep: JobReport, now: float, stall: int, startup_grace: int) -> str:
+    if rep.step is not None and rep.max_steps and rep.step >= rep.max_steps:
+        return S_COMPLETED
+    if rep.step is None:  # 还没有 TB 数据
+        age = (now - rep.start_ts) if rep.start_ts else 0
+        if age > startup_grace and (rep.freshness_sec or 0) > stall:
+            return S_STALLED
+        return S_WARMUP
+    if (rep.freshness_sec or 0) > stall:
+        return S_STALLED
+    return S_RUNNING
+
+
+def _cached_discover(job_id: str, roots: list, disc_cache: Optional[dict], now: float) -> Optional[str]:
+    """带缓存的发现: 命中(config路径)永久缓存; 未命中每 300s 才重试一次, 避免频繁扫 /backup。"""
+    if disc_cache is None:
+        return discover_config_by_job_id(job_id, roots)
+    ent = disc_cache.get(job_id)
+    if ent is not None:
+        val, ts = ent
+        if val:  # 已找到, 永久用
+            return val
+        if now - ts < 300:  # 最近刚扫过还没找到, 先不重复扫
+            return None
+    val = discover_config_by_job_id(job_id, roots)
+    disc_cache[job_id] = (val, now)
+    return val
+
+
+def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
+                 disc_cache: Optional[dict] = None) -> JobReport:
+    """核心: 为一个 job 构造统一报告。谁能填就填。"""
+    roots = get_search_roots(cfg)
+    extra = load_extra().get(job_id, {})
+    stall = cfg["stall"]
+    startup_grace = cfg["startup_grace"]
+
+    rep = JobReport(job_id=job_id, name=name)
+
+    # 1) 训练任务: 自动发现 all_config.json
+    config_path = extra.get("config") or _cached_discover(job_id, roots, disc_cache, now)
+    if config_path and os.path.exists(config_path):
         try:
-            os.kill(int(pid), 15)
-            return True
-        except ProcessLookupError:
-            return False
-    return False
+            ta = json.load(open(config_path, encoding="utf-8")).get("training_args", {})
+        except Exception:
+            ta = {}
+        tb_dir = ta.get("tensorboard")
+        rep.kind = "training"
+        rep.max_steps = ta.get("max_steps")
+        rep.gpu = ta.get("world_size") or None      # 训练卡数 = world_size
+        ckpt_dir = ta.get("exp_ckpt_dir")
+        rep.start_ts = parse_start_ts_from_path(tb_dir or "")
+
+        if tb_dir:
+            tailer = tailers.get(job_id)
+            if tailer is None or tailer.tb_dir != tb_dir:
+                tailer = TBTailer(tb_dir=tb_dir)
+                tailers[job_id] = tailer
+            try:
+                tailer.poll()
+            except Exception as e:  # noqa: BLE001
+                log_line(f"[{job_id}] 读取 TB 失败: {e}")
+            if tailer.latest_step >= 0:
+                rep.step = tailer.latest_step
+                rep.pct = (rep.step / rep.max_steps) if rep.max_steps else None
+                sps = tailer.steps_per_sec()
+                if sps:
+                    spstep = 1.0 / sps
+                    rep.speed_desc = f"{spstep:.1f}秒/step (~{3600/spstep:.0f} step/时)"
+                    if rep.max_steps and rep.step < rep.max_steps:
+                        rep.eta_sec = (rep.max_steps - rep.step) / sps
+                        rep.finish_at = (datetime.now() + timedelta(seconds=rep.eta_sec)).strftime("%m-%d %H:%M")
+                if ta.get("warmup_t") and rep.step <= ta["warmup_t"]:
+                    rep.phase = f"warmup 预热 ({rep.step}/{ta['warmup_t']})"
+                else:
+                    rep.phase = "正式训练"
+                if ta.get("save_step") and rep.step < (rep.max_steps or 0):
+                    rep.next_save_step = min(((rep.step // ta["save_step"]) + 1) * ta["save_step"], rep.max_steps)
+                rep.losses = dict(tailer.losses)
+            mtime = tailer.event_file_mtime()
+            rep.freshness_sec = (now - mtime) if mtime else None
+            rep.latest_ckpt_step = latest_ckpt_step(ckpt_dir)
+
+        rep.elapsed_sec = (now - rep.start_ts) if rep.start_ts else None
+        rep.status = _determine_training_status(rep, now, stall, startup_grace)
+
+    # 2) 通用任务: 指定了日志路径
+    elif extra.get("log"):
+        rep.kind = "generic"
+        logp = extra["log"]
+        if os.path.exists(logp):
+            mtime = os.path.getmtime(logp)
+            rep.freshness_sec = now - mtime
+            rep.start_ts = rep.start_ts or os.path.getctime(logp)
+            rep.elapsed_sec = (now - rep.start_ts) if rep.start_ts else None
+            rep.status = S_STALLED if rep.freshness_sec > stall else S_RUNNING
+            prog = _scan_log_progress(logp, extra.get("progress_regex"))
+            if prog:
+                rep.step, rep.max_steps = prog
+                rep.pct = (rep.step / rep.max_steps) if rep.max_steps else None
+        else:
+            rep.note = f"日志文件不存在: {logp}"
+
+    else:
+        rep.kind = "unknown"
+        rep.status = S_UNKNOWN
+        rep.note = "本机无 ct/平台接口, 且未提供日志路径, 无法获取该任务状态/CPU/GPU。"
+
+    # 3) ct 增强 (若本机有 ct): 覆盖状态 + 补资源, 对任意任务类型都生效
+    if cfg.get("use_ct"):
+        info = ct_job_info(job_id, cfg.get("ct_cmd", "ct"), cfg.get("workspace"))
+        if info:
+            rep.cpu = info.get("cpu_num", rep.cpu)
+            rep.gpu = info.get("gpu_num", rep.gpu)
+            rep.mem = info.get("memory_size", rep.mem)
+            rep.pool = info.get("resource_pool", rep.pool)
+            st = info.get("status")
+            mapping = {"Running": S_RUNNING, "Failed": S_FAILED, "Killed": S_KILLED,
+                       "Succeeded": S_COMPLETED}
+            if st in mapping and rep.kind != "training":
+                rep.status = mapping[st]
+            elif st in ("Failed", "Killed"):
+                rep.status = mapping[st]  # 训练任务也尊重 ct 的失败/终止
+            if info.get("started_at"):
+                rep.note = (rep.note + " ").strip()
+
+    # 缺省名字: 用启动时间
+    if not rep.name:
+        rep.name = _default_name(job_id, rep.start_ts)
+    return rep
 
 
-# ----------------------------- 启动后台监控 -----------------------------
+def _scan_log_progress(path: str, regex: Optional[str]) -> Optional[tuple]:
+    """从日志尾部扫描形如 X/Y 的进度; 找不到返回 None。"""
+    pat = re.compile(regex) if regex else re.compile(r"(\d+)\s*/\s*(\d+)")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    last = None
+    for m in pat.finditer(tail):
+        try:
+            a, b = int(m.group(1)), int(m.group(2))
+            if b > 0 and a <= b:
+                last = (a, b)
+        except Exception:
+            continue
+    return last
 
-def spawn_watchdog(name: str, launch: dict) -> int:
-    """根据 launch 配置字典后台拉起一个 run 进程, 返回 pid。"""
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    session_dir = session_dir_for(name)
-    session_dir.mkdir(parents=True, exist_ok=True)
 
-    opts = {**OPTION_DEFAULTS, **launch.get("options", {})}
-    cmd = [sys.executable, str(Path(__file__).resolve()), "run",
-           "--session-dir", str(session_dir),
-           "--name", safe_name(name),
-           "--interval", str(opts["interval"]),
-           "--report-interval", str(opts["report_interval"]),
-           "--stall", str(opts["stall"]),
-           "--startup-grace", str(opts["startup_grace"]),
-           "--ct-cmd", str(opts["ct_cmd"]),
-           "--config-file", launch.get("config_file", DEFAULT_CONFIG)]
-    if launch.get("config"):
-        cmd += ["--config", launch["config"]]
-    if launch.get("tb_dir"):
-        cmd += ["--tb-dir", launch["tb_dir"]]
-    if launch.get("ckpt_dir"):
-        cmd += ["--ckpt-dir", launch["ckpt_dir"]]
-    if launch.get("max_steps"):
-        cmd += ["--max-steps", str(launch["max_steps"])]
-    if launch.get("job_id"):
-        cmd += ["--job-id", str(launch["job_id"])]
-    if opts.get("webhook"):
-        cmd += ["--webhook", opts["webhook"]]
-    if opts.get("use_ct"):
+# ----------------------------- 渲染 -----------------------------
+
+def render_card(rep: JobReport) -> str:
+    lines = []
+    lines.append(f"**状态**: {rep.status} — {STATUS_DESC.get(rep.status, '')}")
+    kind_cn = {"training": "训练任务", "generic": "通用任务", "unknown": "未知类型"}.get(rep.kind, rep.kind)
+    lines.append(f"**类型**: {kind_cn}")
+
+    # 资源
+    res = []
+    if rep.gpu not in (None, 0, "0"):
+        res.append(f"GPU {rep.gpu}卡")
+    if rep.cpu not in (None, ""):
+        res.append(f"CPU {rep.cpu}")
+    if rep.mem not in (None, ""):
+        res.append(f"内存 {rep.mem}")
+    if rep.pool:
+        res.append(f"池 {rep.pool}")
+    if res:
+        lines.append("**资源**: " + "  ".join(str(x) for x in res))
+
+    # 进度
+    if rep.step is not None and rep.max_steps:
+        lines.append(f"**进度**: {rep.step}/{rep.max_steps} ({rep.pct*100:.1f}%)\n`{progress_bar(rep.pct or 0)}`")
+        if rep.phase:
+            lines.append(f"**阶段**: {rep.phase}")
+        if rep.next_save_step:
+            extra = f" (已存到 {rep.latest_ckpt_step})" if rep.latest_ckpt_step else ""
+            lines.append(f"**下次存 ckpt**: step {rep.next_save_step}{extra}")
+        if rep.speed_desc:
+            lines.append(f"**速度**: {rep.speed_desc}")
+
+    if rep.elapsed_sec is not None:
+        lines.append(f"**已运行**: {fmt_duration(rep.elapsed_sec)}")
+    if rep.eta_sec is not None and rep.status != S_COMPLETED:
+        tail = f" (约 {rep.finish_at} 完成)" if rep.finish_at else ""
+        lines.append(f"**预计剩余**: {fmt_duration(rep.eta_sec)}{tail}")
+    if rep.losses:
+        loss_str = "  ".join(f"{k.split('/')[-1]}={v:.3f}" for k, v in rep.losses.items())
+        lines.append(f"**Loss**: {loss_str}")
+    if rep.freshness_sec is not None:
+        lines.append(f"**数据更新**: {fmt_duration(rep.freshness_sec)}前")
+    lines.append(f"**检查时间**: {now_str()}")
+    if rep.note:
+        lines.append(f"> {rep.note}")
+    return "\n".join(lines)
+
+
+def card_title(rep: JobReport) -> str:
+    return f"watchdog播报：任务 {rep.job_id}（{rep.name}）"
+
+
+def level_for(status: str) -> str:
+    if status in ABNORMAL:
+        return "alert"
+    if status == S_COMPLETED:
+        return "ok"
+    return "info"
+
+
+# ----------------------------- 每 job 通知状态 -----------------------------
+
+def job_state_path(job_id: str) -> Path:
+    return STATE_DIR / f"{job_id}.json"
+
+
+def handle_notifications(rep: JobReport, notifier: FeishuNotifier, report_interval: int, now: float) -> None:
+    sp = job_state_path(rep.job_id)
+    st = load_json(sp, {})
+    started = st.get("started_notified", False)
+    last_report = st.get("last_report_ts", 0)
+    incident = st.get("incident")
+    completed = st.get("completed_notified", False)
+
+    title = card_title(rep)
+    body = render_card(rep)
+
+    if not started:
+        notifier.send(title, "🟦 已开始监控该任务。\n\n" + body, level="info")
+        started = True
+        last_report = now
+    elif rep.status == S_COMPLETED:
+        if not completed:
+            notifier.send(title, "✅ 训练已完成。\n\n" + body, level="ok")
+            completed = True
+        incident = None
+    elif rep.status in ABNORMAL:
+        if incident != rep.status:
+            hint = "\n> ⚠️ 请人工确认 (查看 job 状态 / 节点)。" if rep.status == S_STALLED else ""
+            notifier.send(title, "🚨 任务异常告警！\n\n" + body + hint, level="alert")
+            incident = rep.status
+    else:  # 正常
+        if incident is not None:
+            notifier.send(title, "🟢 已从异常恢复。\n\n" + body, level="ok")
+            incident = None
+            last_report = now
+        elif rep.status in (S_RUNNING,) and (now - last_report) >= report_interval:
+            notifier.send(title, "📊 进度播报\n\n" + body, level="info")
+            last_report = now
+        elif rep.status == S_UNKNOWN and (now - last_report) >= report_interval:
+            # 未知任务也按节奏播报一次现状(不告警)
+            notifier.send(title, "ℹ️ 现状\n\n" + body, level="info")
+            last_report = now
+
+    save_json(sp, {
+        "started_notified": started, "last_report_ts": last_report,
+        "incident": incident, "completed_notified": completed,
+        "last_status": rep.status, "name": rep.name, "kind": rep.kind,
+        "step": rep.step, "max_steps": rep.max_steps, "pct": rep.pct,
+        "eta_sec": rep.eta_sec, "updated_at": now_str(),
+    })
+
+
+# ----------------------------- 全表快照 -----------------------------
+
+def write_status_md(reports: list) -> None:
+    lines = ["# Watchdog 监控表快照", "", f"更新时间: {now_str()}", ""]
+    lines.append("| Job | 名称 | 类型 | 状态 | 进度 | 已运行 | 预计剩余 |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for r in reports:
+        prog = f"{r.step}/{r.max_steps} ({r.pct*100:.1f}%)" if (r.step is not None and r.max_steps) else "-"
+        lines.append(f"| {r.job_id} | {r.name} | {r.kind} | {r.status} | {prog} | "
+                     f"{fmt_duration(r.elapsed_sec)} | {fmt_duration(r.eta_sec) if r.eta_sec else '-'} |")
+    lines.append("")
+    for r in reports:
+        lines.append(f"## {r.job_id} · {r.name}\n")
+        lines.append(render_card(r))
+        lines.append("")
+    STATUS_MD.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ----------------------------- 守护进程主循环 -----------------------------
+
+def serve(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    # 命令行覆盖
+    for k in ("interval", "report_interval", "stall", "startup_grace"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cfg[k] = v
+    if getattr(args, "use_ct", False):
+        cfg["use_ct"] = True
+
+    PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+    webhook = getattr(args, "webhook", None) or cfg.get("feishu_webhook") or load_webhook_from_config(str(CONFIG_FILE))
+    notifier = FeishuNotifier(webhook=webhook, logger=log_line)
+
+    log_line(f"watchdog 守护进程启动 pid={os.getpid()} "
+             f"interval={cfg['interval']}s report={cfg['report_interval']}s "
+             f"stall={cfg['stall']}s notify={'on' if notifier.enabled else 'off'} "
+             f"ct={'on' if cfg.get('use_ct') and ct_available(cfg.get('ct_cmd','ct')) else 'off'}")
+
+    tailers: dict = {}
+    disc_cache: dict = {}
+    while True:
+        now = now_ts()
+        entries = read_watchlist()
+        reports = []
+        seen = set()
+        for job_id, name in entries:
+            seen.add(job_id)
+            try:
+                rep = build_report(job_id, name, cfg, tailers, now, disc_cache)
+                handle_notifications(rep, notifier, cfg["report_interval"], now)
+                reports.append(rep)
+                append_jsonl(EVENTS, {"time": now_str(), "job": job_id, "name": rep.name,
+                                      "status": rep.status, "step": rep.step, "pct": rep.pct})
+                log_line(f"[{job_id}] {rep.name} status={rep.status} "
+                         f"step={rep.step}/{rep.max_steps} fresh={fmt_duration(rep.freshness_sec)}")
+            except Exception as e:  # noqa: BLE001
+                log_line(f"[{job_id}] 评估失败: {e}")
+        # 清掉已移除 job 的 tailer 缓存
+        for jid in list(tailers.keys()):
+            if jid not in seen:
+                tailers.pop(jid, None)
+        try:
+            write_status_md(reports)
+        except Exception as e:  # noqa: BLE001
+            log_line(f"写 status.md 失败: {e}")
+        time.sleep(cfg["interval"])
+
+
+def daemon_alive() -> Optional[int]:
+    if not PIDFILE.exists():
+        return None
+    pid = PIDFILE.read_text().strip()
+    if pid.isdigit() and os.path.exists(f"/proc/{pid}"):
+        return int(pid)
+    return None
+
+
+# ----------------------------- CLI -----------------------------
+
+def cmd_start(args: argparse.Namespace) -> None:
+    pid = daemon_alive()
+    if pid and not args.foreground:
+        print(f"watchdog 已在运行 (pid={pid})。如需改参数: watchdog stop 后再 start, 或 watchdog restart。")
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if args.foreground:
+        serve(args)
+        return
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_serve"]
+    for k in ("interval", "report_interval", "stall", "startup_grace"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cmd += [f"--{k.replace('_', '-')}", str(v)]
+    if args.use_ct:
         cmd += ["--use-ct"]
-    if opts.get("workspace"):
-        cmd += ["--workspace", opts["workspace"]]
-    if opts.get("keep_alive"):
-        cmd += ["--keep-alive"]
-
-    out = (session_dir / "watchdog.stdout").open("a", encoding="utf-8")
+    if args.webhook:
+        cmd += ["--webhook", args.webhook]
+    out = LOGFILE.open("a", encoding="utf-8")
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out, stderr=subprocess.STDOUT,
                             start_new_session=True)
-    (session_dir / "pid").write_text(str(proc.pid), encoding="utf-8")
-    return proc.pid
+    PIDFILE.write_text(str(proc.pid), encoding="utf-8")
+    print(f"watchdog 已启动 (pid={proc.pid})。")
+    print(f"监控表: {WATCHLIST}")
+    print(f"全表快照: {STATUS_MD}")
+    print(f"日志: {LOGFILE}")
 
 
-def _ns_for_build(config=None, tb_dir=None, ckpt_dir=None, max_steps=None,
-                  job_id=None, name=None) -> argparse.Namespace:
-    return argparse.Namespace(config=config, tb_dir=tb_dir, ckpt_dir=ckpt_dir,
-                              max_steps=max_steps, job_id=job_id, name=name)
+def cmd_stop(args: argparse.Namespace) -> None:
+    pid = daemon_alive()
+    if not pid:
+        print("watchdog 未在运行。")
+        return
+    try:
+        os.kill(pid, 15)
+        print(f"已停止 watchdog (pid={pid})。")
+    except ProcessLookupError:
+        print("进程已不存在。")
 
 
-# ----------------------------- CLI 子命令 -----------------------------
-
-def _add_common_run_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--config", help="all_config.json 路径 (自动读取 tb_dir/max_steps 等)")
-    p.add_argument("--tb-dir", help="TensorBoard 目录 (不用 --config 时指定)")
-    p.add_argument("--ckpt-dir", help="exp_ckpt_dir (可自动定位 all_config.json)")
-    p.add_argument("--max-steps", type=int, help="总步数 (不用 --config 时指定)")
-    p.add_argument("--job-id", help="Cybertron job id (缺省从 tb 路径解析)")
-    p.add_argument("--name", help="session 名 (缺省 job_<id>)")
-    p.add_argument("--interval", type=int, default=120, help="状态检查间隔秒, 默认120")
-    p.add_argument("--report-interval", type=int, default=3600, help="正常时进度汇报间隔秒, 默认3600")
-    p.add_argument("--stall", type=int, default=1200, help="多久无更新判定卡死(秒), 默认1200")
-    p.add_argument("--startup-grace", type=int, default=3600, help="启动宽限期(秒), 期间无数据不算异常, 默认3600")
-    p.add_argument("--webhook", help="飞书 webhook (优先级最高)")
-    p.add_argument("--config-file", default=DEFAULT_CONFIG, help="含 feishu_webhook 的配置文件")
-    p.add_argument("--use-ct", action="store_true", help="尝试用 ct 拿权威状态 (本机需有 ct)")
-    p.add_argument("--ct-cmd", default="ct", help="ct 可执行名/路径")
-    p.add_argument("--workspace", default=None, help="ct 执行的工作目录")
-    p.add_argument("--keep-alive", action="store_true", help="终态后不退出, 继续记录")
-
-
-def _options_from_args(args: argparse.Namespace) -> dict:
-    """把命令行里显式给出的监控参数收集成 options (只收非默认/显式项)。"""
-    opts = {}
-    for key in ("interval", "report_interval", "stall", "startup_grace",
-                "use_ct", "ct_cmd", "workspace", "keep_alive", "webhook"):
-        val = getattr(args, key, None)
-        if val is not None:
-            opts[key] = val
-    return opts
+def cmd_restart(args: argparse.Namespace) -> None:
+    cmd_stop(args)
+    time.sleep(1)
+    cmd_start(args)
 
 
 def cmd_add(args: argparse.Namespace) -> None:
-    """核心命令: watchdog add <job_id> —— 自动发现配置并启动监控, 登记到监控表。"""
-    reg = load_registry()
-    roots = get_search_roots(args.config_file)
-    cli_opts = _options_from_args(args)
+    cfg = load_config()
+    job_id = str(args.job_id)
+    name = " ".join(args.name).strip() if args.name else ""
 
-    for job_id in args.job_ids:
-        job_id = str(job_id)
-        config = args.config
-        tb_dir = args.tb_dir
-        max_steps = args.max_steps
-        ckpt_dir = args.ckpt_dir
+    # 记录高级配置(日志路径/手动 config)
+    if args.log or args.config:
+        extra = load_extra()
+        e = extra.get(job_id, {})
+        if args.log:
+            e["log"] = args.log
+        if args.config:
+            e["config"] = args.config
+        extra[job_id] = e
+        save_extra(extra)
 
-        if not config and not tb_dir:
-            config = discover_config_by_job_id(job_id, roots)
-            if not config:
-                print(f"[{job_id}] 未能自动定位 all_config.json。")
-                print("  可手动指定: --config <all_config.json> 或 --tb-dir <dir> --max-steps <N>")
-                print(f"  (搜索根目录: {roots})")
-                continue
-            print(f"[{job_id}] 已自动定位配置: {config}")
+    cfg_path = args.config or discover_config_by_job_id(job_id, get_search_roots(cfg))
+    # 缺省名字: 用启动时间(能发现的话)
+    if not name:
+        start_ts = None
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                tb = json.load(open(cfg_path, encoding="utf-8")).get("training_args", {}).get("tensorboard", "")
+                start_ts = parse_start_ts_from_path(tb)
+            except Exception:
+                pass
+        name = _default_name(job_id, start_ts)
 
-        # 校验并抽取 tb_dir / max_steps / name
-        try:
-            rc = build_run_config(_ns_for_build(config=config, tb_dir=tb_dir,
-                                                ckpt_dir=ckpt_dir, max_steps=max_steps,
-                                                job_id=job_id, name=args.name))
-        except SystemExit as e:
-            print(f"[{job_id}] 配置无效: {e}")
-            continue
-
-        name = safe_name(args.name or rc.name or f"job_{job_id}")
-        sdir = session_dir_for(name)
-        if name in reg and is_alive(sdir):
-            print(f"[{job_id}] 已在监控中 (session={name}, pid={read_pid(sdir)})。"
-                  f" 如需改参数用: watchdog set {job_id} ...")
-            continue
-
-        options = {**OPTION_DEFAULTS, **cli_opts}
-        launch = {
-            "job_id": job_id,
-            "config": config,
-            "tb_dir": rc.tb_dir,
-            "ckpt_dir": rc.ckpt_dir,
-            "max_steps": rc.max_steps,
-            "options": options,
-            "config_file": args.config_file,
-        }
-        if args.no_start:
-            reg[name] = {**launch, "name": name, "session_dir": str(sdir),
-                         "added_at": now_str(), "started": False}
-            save_registry(reg)
-            print(f"[{job_id}] 已登记 (未启动)。用 watchdog restart {job_id} 启动。")
-            continue
-
-        pid = spawn_watchdog(name, launch)
-        reg[name] = {**launch, "name": name, "session_dir": str(sdir),
-                     "added_at": now_str(), "started": True}
-        save_registry(reg)
-        print(f"[{job_id}] 已启动监控: session={name} pid={pid} "
-              f"step_total={rc.max_steps}")
-        print(f"         状态文档: {sdir / 'status.md'}")
-
-
-def _find_entry(reg: dict, key: str):
-    """按 job_id 或 session 名找注册项, 返回 (name, entry) 或 (None, None)。"""
-    key = str(key)
-    if key in reg:
-        return key, reg[key]
-    for name, e in reg.items():
-        if str(e.get("job_id")) == key:
-            return name, e
-    # 允许用 safe_name 后的名字
-    sk = safe_name(key)
-    if sk in reg:
-        return sk, reg[sk]
-    return None, None
+    upsert_entry(job_id, name)
+    kind = "训练任务" if cfg_path else ("通用任务(日志)" if args.log else "未知(需 ct/日志)")
+    print(f"[{job_id}] 已加入监控表, 名称='{name}', 识别为 {kind}。")
+    if not daemon_alive():
+        print("提示: watchdog 守护进程未运行, 用  python watchdog.py start  开启。")
 
 
 def cmd_rm(args: argparse.Namespace) -> None:
-    reg = load_registry()
-    for key in args.job_ids:
-        name, entry = _find_entry(reg, key)
-        if not entry:
-            print(f"[{key}] 不在监控表中。")
-            continue
-        sdir = session_dir_for(name)
-        if is_alive(sdir):
-            stop_session(sdir)
-            print(f"[{key}] 已停止 (pid={read_pid(sdir)})。")
-        reg.pop(name, None)
-        save_registry(reg)
-        if args.purge and sdir.exists():
-            shutil.rmtree(sdir, ignore_errors=True)
-            print(f"[{key}] 已删除 session 目录。")
-        print(f"[{key}] 已从监控表移除。")
+    for job_id in args.job_ids:
+        job_id = str(job_id)
+        ok = remove_from_watchlist(job_id)
+        extra = load_extra()
+        if job_id in extra:
+            extra.pop(job_id)
+            save_extra(extra)
+        if args.purge:
+            sp = job_state_path(job_id)
+            if sp.exists():
+                sp.unlink()
+        print(f"[{job_id}] " + ("已从监控表移除。" if ok else "不在监控表中。"))
 
 
 def cmd_ls(args: argparse.Namespace) -> None:
-    reg = load_registry()
-    if not reg:
-        print("监控表为空。用  watchdog add <job_id>  添加。")
+    entries = read_watchlist()
+    pid = daemon_alive()
+    print(f"守护进程: {'运行中 pid=' + str(pid) if pid else '未运行'}   监控表: {WATCHLIST}")
+    if not entries:
+        print("监控表为空。用  python watchdog.py add <job_id> [名字]  添加。")
         return
-    header = f"{'JOB':<8} {'NAME':<22} {'PID':<8} {'ALIVE':<6} {'STATUS':<10} {'STEP':<12} {'PCT':<7} {'ETA':<12} LAST"
+    header = f"{'JOB':<8} {'NAME':<16} {'STATUS':<10} {'STEP':<12} {'PCT':<7} {'ETA':<12} LAST"
     print(header)
     print("-" * len(header))
-    for name, e in reg.items():
-        sdir = session_dir_for(name)
-        st = load_json(sdir / "state.json", {})
-        pid = read_pid(sdir) or "-"
-        alive = "yes" if is_alive(sdir) else "no"
+    for job_id, name in entries:
+        st = load_json(job_state_path(job_id), {})
         status = st.get("last_status", "-")
         step = st.get("step")
-        step_s = f"{step}/{e.get('max_steps','?')}" if step is not None else "-"
+        mx = st.get("max_steps")
+        step_s = f"{step}/{mx}" if (step is not None and mx) else "-"
         pct = st.get("pct")
         pct_s = f"{pct*100:.1f}%" if isinstance(pct, (int, float)) else "-"
         eta = st.get("eta_sec")
         eta_s = fmt_duration(eta) if isinstance(eta, (int, float)) else "-"
-        last = st.get("last_checked_at", "-")
-        print(f"{str(e.get('job_id','-')):<8} {name:<22} {pid:<8} {alive:<6} "
-              f"{status:<10} {step_s:<12} {pct_s:<7} {eta_s:<12} {last}")
+        print(f"{job_id:<8} {(name or st.get('name') or '-'):<16} {status:<10} "
+              f"{step_s:<12} {pct_s:<7} {eta_s:<12} {st.get('updated_at','-')}")
+    print("\n(详细进度看:  python watchdog.py show <job_id>  或  cat status.md)")
 
 
 def cmd_show(args: argparse.Namespace) -> None:
-    reg = load_registry()
-    name, entry = _find_entry(reg, args.job_id)
-    if not entry:
-        print(f"[{args.job_id}] 不在监控表中。")
-        return
-    md = session_dir_for(name) / "status.md"
-    if md.exists():
-        print(md.read_text(encoding="utf-8"))
-    else:
-        print(f"[{args.job_id}] 尚无 status.md (可能刚启动)。")
-
-
-def cmd_set(args: argparse.Namespace) -> None:
-    """改监控参数并自动重启该 session。"""
-    reg = load_registry()
-    name, entry = _find_entry(reg, args.job_id)
-    if not entry:
-        print(f"[{args.job_id}] 不在监控表中。先 add。")
-        return
-    changed = _options_from_args(args)
-    if not changed:
-        print("未指定要修改的参数。可改: --interval/--report-interval/--stall/"
-              "--startup-grace/--use-ct/--webhook/--keep-alive 等")
-        return
-    entry.setdefault("options", {}).update(changed)
-    reg[name] = entry
-    save_registry(reg)
-    sdir = session_dir_for(name)
-    if is_alive(sdir):
-        stop_session(sdir)
-        time.sleep(1)
-    pid = spawn_watchdog(name, entry)
-    entry["started"] = True
-    save_registry(reg)
-    print(f"[{args.job_id}] 已更新参数 {changed} 并重启 (pid={pid})。")
-
-
-def cmd_restart(args: argparse.Namespace) -> None:
-    reg = load_registry()
-    keys = args.job_ids or list(reg.keys())
-    for key in keys:
-        name, entry = _find_entry(reg, key)
-        if not entry:
-            print(f"[{key}] 不在监控表中。")
-            continue
-        sdir = session_dir_for(name)
-        if is_alive(sdir):
-            stop_session(sdir)
-            time.sleep(1)
-        pid = spawn_watchdog(name, entry)
-        entry["started"] = True
-        reg[name] = entry
-        save_registry(reg)
-        print(f"[{key}] 已重启 (pid={pid})。")
-
-
-def cmd_stop(args: argparse.Namespace) -> None:
-    reg = load_registry()
-    keys = args.job_ids or list(reg.keys())
-    for key in keys:
-        name, entry = _find_entry(reg, key)
-        # 也允许直接用 session 名停未登记的
-        sdir = session_dir_for(name or key)
-        if not sdir.exists():
-            print(f"[{key}] 未找到对应 session。")
-            continue
-        if stop_session(sdir):
-            print(f"[{key}] 已停止 (pid={read_pid(sdir)})。")
-        else:
-            print(f"[{key}] 进程不存在或已停止。")
+    cfg = load_config()
+    if cfg.get("use_ct"):
+        pass
+    # 直接现算一次, 保证最新
+    tailers: dict = {}
+    entries = dict(read_watchlist())
+    job_id = str(args.job_id)
+    name = entries.get(job_id, "")
+    rep = build_report(job_id, name, cfg, tailers, now_ts())
+    print(card_title(rep))
+    print(render_card(rep))
 
 
 def cmd_once(args: argparse.Namespace) -> None:
-    """单次检查并打印报告 (可选发一条飞书), 用于调试。支持仅给 --job-id 自动发现。"""
-    if args.job_id and not args.config and not args.tb_dir:
-        cfg = discover_config_by_job_id(str(args.job_id), get_search_roots(args.config_file))
-        if cfg:
-            args.config = cfg
-    rc = build_run_config(args)
-    tailer = TBTailer(tb_dir=rc.tb_dir)
-    tailer.poll()
+    cfg = load_config()
+    if args.use_ct:
+        cfg["use_ct"] = True
+    tailers: dict = {}
+    entries = read_watchlist()
+    if args.job_id:
+        entries = [(str(args.job_id), dict(entries).get(str(args.job_id), ""))]
     now = now_ts()
-    ct_state = ct_status(rc.job_id, args.ct_cmd, args.workspace) if (args.use_ct and rc.job_id) else None
-    m = build_metrics(rc, tailer, now)
-    status = determine_status(m, rc, now, args.stall, args.startup_grace, ct_state)
-    print(render_card(rc, m, status))
-    if args.send:
-        webhook = args.webhook or load_webhook_from_config(args.config_file)
-        FeishuNotifier(webhook=webhook).send(
-            f"📊 训练进度(手动) · {rc.prefix or rc.name}", render_card(rc, m, status),
-            level=level_for(status))
+    reports = []
+    for job_id, name in entries:
+        rep = build_report(job_id, name, cfg, tailers, now)
+        reports.append(rep)
+        print(card_title(rep))
+        print(render_card(rep))
+        print("-" * 60)
+        if args.send:
+            webhook = cfg.get("feishu_webhook") or load_webhook_from_config(str(CONFIG_FILE))
+            FeishuNotifier(webhook=webhook).send(card_title(rep), render_card(rep), level=level_for(rep.status))
 
 
 def cmd_test_notify(args: argparse.Namespace) -> None:
-    webhook = args.webhook or load_webhook_from_config(args.config_file)
+    cfg = load_config()
+    webhook = args.webhook or cfg.get("feishu_webhook") or load_webhook_from_config(str(CONFIG_FILE))
     n = FeishuNotifier(webhook=webhook)
     if not n.enabled:
-        print("未配置 webhook。请用 --webhook 或在 config.json 里填 feishu_webhook。")
+        print("未配置 webhook。请在 config.json 填 feishu_webhook, 或用 --webhook。")
         return
-    ok = n.send("✅ Watchdog 测试消息",
-                f"这是一条来自 watchdog 的测试消息。\n**时间**: {now_str()}", level="ok")
+    ok = n.send("watchdog播报：测试消息", f"这是一条测试消息。\n**时间**: {now_str()}", level="ok")
     print("发送成功。" if ok else "发送失败, 请检查 webhook。")
 
 
-def _add_option_args(p: argparse.ArgumentParser) -> None:
-    """add/set 共用的可调监控参数 (默认 None, 表示不覆盖)。"""
-    p.add_argument("--interval", type=int, help="状态检查间隔秒 (默认120)")
-    p.add_argument("--report-interval", type=int, help="正常时进度汇报间隔秒 (默认3600)")
-    p.add_argument("--stall", type=int, help="多久无更新判定卡死(秒) (默认1200)")
-    p.add_argument("--startup-grace", type=int, help="启动宽限期(秒) (默认3600)")
+def _add_service_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--interval", type=int, help="状态检查间隔(秒)")
+    p.add_argument("--report-interval", type=int, help="正常时进度播报间隔(秒)")
+    p.add_argument("--stall", type=int, help="多久无更新判定卡死(秒)")
+    p.add_argument("--startup-grace", type=int, help="启动宽限期(秒)")
+    p.add_argument("--use-ct", action="store_true", help="用 ct 拿权威状态/资源(本机需有 ct)")
     p.add_argument("--webhook", help="飞书 webhook")
-    p.add_argument("--use-ct", action="store_true", default=None, help="用 ct 拿权威状态")
-    p.add_argument("--ct-cmd", help="ct 可执行名/路径")
-    p.add_argument("--workspace", help="ct 执行工作目录")
-    p.add_argument("--keep-alive", action="store_true", default=None, help="终态后不退出")
-    p.add_argument("--config-file", default=DEFAULT_CONFIG, help="含 feishu_webhook/search_roots 的配置")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="训练任务 watchdog (监控表: add/rm/ls/set + 飞书告警/进度)")
+    parser = argparse.ArgumentParser(description="训练/任务 watchdog (监控表 + 单守护进程 + 飞书播报)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # ---- 监控表核心命令 ----
-    p_add = sub.add_parser("add", help="添加 job 到监控表并启动 (只需 job id)")
-    p_add.add_argument("job_ids", nargs="+", help="一个或多个 job id")
-    p_add.add_argument("--config", help="手动指定 all_config.json (跳过自动发现)")
-    p_add.add_argument("--tb-dir", help="手动指定 TB 目录")
-    p_add.add_argument("--ckpt-dir", help="手动指定 exp_ckpt_dir")
-    p_add.add_argument("--max-steps", type=int, help="手动指定总步数")
-    p_add.add_argument("--name", help="自定义 session 名 (缺省 job_<id>)")
-    p_add.add_argument("--no-start", action="store_true", help="只登记不启动")
-    _add_option_args(p_add)
+    p_start = sub.add_parser("start", help="开启 watchdog 守护进程")
+    _add_service_args(p_start)
+    p_start.add_argument("--foreground", action="store_true", help="前台运行(调试)")
+    p_start.set_defaults(func=cmd_start)
+
+    p_stop = sub.add_parser("stop", help="关闭 watchdog 守护进程")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_restart = sub.add_parser("restart", help="重启守护进程(用于改参数)")
+    _add_service_args(p_restart)
+    p_restart.set_defaults(func=cmd_restart)
+
+    p_add = sub.add_parser("add", help="加 job 到监控表 (只需 job id, 可带名字)")
+    p_add.add_argument("job_id", help="job id")
+    p_add.add_argument("name", nargs="*", help="任务名字(可选, 缺省用启动时间)")
+    p_add.add_argument("--log", help="通用任务的日志文件路径(非训练任务用)")
+    p_add.add_argument("--config", help="手动指定 all_config.json")
     p_add.set_defaults(func=cmd_add)
 
-    p_rm = sub.add_parser("rm", help="从监控表移除 (并停止)")
+    p_rm = sub.add_parser("rm", help="从监控表移除")
     p_rm.add_argument("job_ids", nargs="+")
-    p_rm.add_argument("--purge", action="store_true", help="同时删除 session 目录")
+    p_rm.add_argument("--purge", action="store_true", help="同时清除该 job 的通知状态")
     p_rm.set_defaults(func=cmd_rm)
 
-    p_ls = sub.add_parser("ls", help="查看监控表 (状态/进度)")
+    p_ls = sub.add_parser("ls", help="查看监控表")
     p_ls.set_defaults(func=cmd_ls)
 
-    p_show = sub.add_parser("show", help="查看某 job 的详细状态快照")
+    p_show = sub.add_parser("show", help="现算并打印某 job 的详细快照")
     p_show.add_argument("job_id")
     p_show.set_defaults(func=cmd_show)
 
-    p_set = sub.add_parser("set", help="修改某 job 的监控参数并重启")
-    p_set.add_argument("job_id")
-    _add_option_args(p_set)
-    p_set.set_defaults(func=cmd_set)
+    p_once = sub.add_parser("once", help="现算一次(全部或单个)并打印")
+    p_once.add_argument("job_id", nargs="?")
+    p_once.add_argument("--send", action="store_true")
+    p_once.add_argument("--use-ct", action="store_true")
+    p_once.set_defaults(func=cmd_once)
 
-    p_restart = sub.add_parser("restart", help="重启监控 (缺省全部)")
-    p_restart.add_argument("job_ids", nargs="*")
-    p_restart.set_defaults(func=cmd_restart)
-
-    p_stop = sub.add_parser("stop", help="停止监控 (缺省全部)")
-    p_stop.add_argument("job_ids", nargs="*")
-    p_stop.set_defaults(func=cmd_stop)
-
-    p_test = sub.add_parser("test-notify", help="发送一条飞书测试消息")
+    p_test = sub.add_parser("test-notify", help="发一条飞书测试消息")
     p_test.add_argument("--webhook")
-    p_test.add_argument("--config-file", default=DEFAULT_CONFIG)
     p_test.set_defaults(func=cmd_test_notify)
 
-    # ---- 底层/调试命令 ----
-    p_run = sub.add_parser("run", help="(内部)前台运行监控循环")
-    _add_common_run_args(p_run)
-    p_run.add_argument("--session-dir", required=True)
-    p_run.set_defaults(func=monitor)
-
-    p_once = sub.add_parser("once", help="单次检查并打印报告 (支持仅 --job-id)")
-    _add_common_run_args(p_once)
-    p_once.add_argument("--send", action="store_true", help="同时发一条飞书")
-    p_once.set_defaults(func=cmd_once)
+    p_serve = sub.add_parser("_serve", help="(内部)守护进程主循环")
+    _add_service_args(p_serve)
+    p_serve.set_defaults(func=serve)
 
     args = parser.parse_args()
     args.func(args)

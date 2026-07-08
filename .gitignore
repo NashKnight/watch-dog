@@ -1,5 +1,15 @@
 __pycache__/
 *.pyc
-sessions/
+
+# 运行时/用户数据
 config.json
+watchlist.txt
+jobs_extra.json
 registry.json
+state/
+sessions/
+status.md
+watchdog.log
+watchdog.pid
+events.jsonl
+*.tmp

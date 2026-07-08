@@ -1,0 +1,3 @@
+# watchdog 依赖 (训练环境 /root/minicpmo 里已自带这两个)
+requests>=2.25
+tensorboard>=2.0

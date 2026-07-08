@@ -703,7 +703,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         print(f"watchdog 已在运行 (pid={pid})。如需改参数: watchdog stop 后再 start, 或 watchdog restart。")
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if args.foreground:
+    if getattr(args, "foreground", False):
         serve(args)
         return
     cmd = [sys.executable, str(Path(__file__).resolve()), "_serve"]

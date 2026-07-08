@@ -449,6 +449,39 @@ def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
     return rep
 
 
+def extract_log_from_cmd(cmd: str) -> Optional[str]:
+    """从一条完整启动命令里抽取日志文件路径 (处理相对路径 + 前面的 cd)。
+
+    支持:  ``>> a.log`` / ``> a.log`` / ``&> a.log`` / ``2>&1``(忽略) / ``tee [-a] a.log``。
+    相对路径会用重定向之前最后一个 ``cd <dir>`` 拼成绝对路径。
+    """
+    redir_re = re.compile(r"(?:&>>?|1?>>?)\s*([^\s&|;<>]+)")
+    tee_re = re.compile(r"\btee\b\s+(?:-a\s+)?([^\s&|;<>]+)")
+    candidates = []  # (pos, target)
+    for m in redir_re.finditer(cmd):
+        tgt = m.group(1)
+        if tgt in ("/dev/null",) or tgt.startswith("&"):
+            continue
+        candidates.append((m.start(), tgt))
+    for m in tee_re.finditer(cmd):
+        candidates.append((m.start(), m.group(1)))
+    if not candidates:
+        return None
+    candidates.sort()
+    chosen = next((c for c in candidates if c[1].endswith(".log")), candidates[0])
+    pos, target = chosen
+    if os.path.isabs(target):
+        return os.path.normpath(target)
+    # 找该重定向之前最后一个 cd DIR 作为 base
+    base = None
+    for m in re.finditer(r"\bcd\s+([^\s&|;]+)", cmd):
+        if m.start() < pos and os.path.isabs(m.group(1)):
+            base = m.group(1)
+    if base:
+        return os.path.normpath(os.path.join(base, target))
+    return target
+
+
 def _scan_log_progress(path: str, regex: Optional[str]) -> Optional[tuple]:
     """从日志尾部扫描形如 X/Y 的进度; 找不到返回 None。"""
     pat = re.compile(regex) if regex else re.compile(r"(\d+)\s*/\s*(\d+)")
@@ -715,14 +748,25 @@ def cmd_add(args: argparse.Namespace) -> None:
     job_id = str(args.job_id)
     name = " ".join(args.name).strip() if args.name else ""
 
-    # 记录高级配置(日志路径/手动 config)
-    if args.log or args.config:
+    # 若给了完整启动命令, 自动抽取日志路径
+    log_path = args.log
+    if not log_path and args.cmd:
+        log_path = extract_log_from_cmd(args.cmd)
+        if log_path:
+            print(f"[{job_id}] 从启动命令解析出日志: {log_path}")
+        else:
+            print(f"[{job_id}] 未能从命令里解析出日志路径, 请改用 --log 手动指定。")
+
+    # 记录高级配置(日志路径/手动 config/命令)
+    if log_path or args.config or args.cmd:
         extra = load_extra()
         e = extra.get(job_id, {})
-        if args.log:
-            e["log"] = args.log
+        if log_path:
+            e["log"] = log_path
         if args.config:
             e["config"] = args.config
+        if args.cmd:
+            e["cmd"] = args.cmd
         extra[job_id] = e
         save_extra(extra)
 
@@ -739,7 +783,7 @@ def cmd_add(args: argparse.Namespace) -> None:
         name = _default_name(job_id, start_ts)
 
     upsert_entry(job_id, name)
-    kind = "训练任务" if cfg_path else ("通用任务(日志)" if args.log else "未知(需 ct/日志)")
+    kind = "训练任务" if cfg_path else ("通用任务(日志)" if log_path else "未知(需 ct/日志)")
     print(f"[{job_id}] 已加入监控表, 名称='{name}', 识别为 {kind}。")
     if not daemon_alive():
         print("提示: watchdog 守护进程未运行, 用  python watchdog.py start  开启。")
@@ -860,6 +904,7 @@ def main() -> int:
     p_add.add_argument("job_id", help="job id")
     p_add.add_argument("name", nargs="*", help="任务名字(可选, 缺省用启动时间)")
     p_add.add_argument("--log", help="通用任务的日志文件路径(非训练任务用)")
+    p_add.add_argument("--cmd", help="完整启动命令(自动从中抽取日志路径, 非训练任务用)")
     p_add.add_argument("--config", help="手动指定 all_config.json")
     p_add.set_defaults(func=cmd_add)
 

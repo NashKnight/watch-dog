@@ -417,6 +417,17 @@ def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
             if prog:
                 rep.step, rep.max_steps = prog
                 rep.pct = (rep.step / rep.max_steps) if rep.max_steps else None
+                if rep.max_steps and rep.step < rep.max_steps:
+                    est = _scan_log_eta(logp, extra.get("progress_regex"))
+                    if est:
+                        rep.eta_sec = est["eta_sec"]
+                        rep.finish_at = (datetime.now() + timedelta(seconds=est["eta_sec"])).strftime("%m-%d %H:%M")
+                        rpm = est["rate_per_sec"] * 60
+                        if rpm >= 1:
+                            rep.speed_desc = f"{rpm:.1f} 项/分 (~{est['rate_per_sec']*3600:.0f} 项/时)"
+                        else:
+                            spi = 1 / est["rate_per_sec"] if est["rate_per_sec"] else 0
+                            rep.speed_desc = f"{spi:.0f} 秒/项 (~{est['rate_per_sec']*3600:.0f} 项/时)"
         else:
             rep.note = f"日志文件不存在: {logp}"
 
@@ -502,6 +513,55 @@ def _scan_log_progress(path: str, regex: Optional[str]) -> Optional[tuple]:
         except Exception:
             continue
     return last
+
+
+_LOG_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+
+
+def _scan_log_eta(path: str, regex: Optional[str]) -> Optional[dict]:
+    """用日志里的『时间戳 + X/Y 进度』估算速率与 ETA(通用任务用)。
+
+    需要日志行同时含形如 `2026-07-10 06:03:05` 的时间戳和 `X/Y` 进度
+    (旁路进度脚本 eval_progress_tracker.sh 就是这种格式)。找不到足够
+    数据点则返回 None。返回 {eta_sec, rate_per_sec, cur, total}。
+    """
+    pat = re.compile(regex) if regex else re.compile(r"(\d+)\s*/\s*(\d+)")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 131072))   # 读较大尾部, 覆盖更长时间窗
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    points = []   # (epoch_sec, step, total)
+    for line in tail.splitlines():
+        pm = pat.search(line)
+        if not pm:
+            continue
+        tm = _LOG_TS_RE.search(line)
+        if not tm:
+            continue
+        try:
+            a, b = int(pm.group(1)), int(pm.group(2))
+            if b <= 0 or a > b:
+                continue
+            ts = datetime.strptime(f"{tm.group(1)} {tm.group(2)}", "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        points.append((ts.timestamp(), a, b))
+    if len(points) < 2:
+        return None
+    t0, s0, _ = points[0]
+    t1, s1, total = points[-1]
+    if t1 <= t0 or s1 <= s0:
+        return None
+    rate = (s1 - s0) / (t1 - t0)     # step/秒 (自窗口起点的平均速率)
+    if rate <= 0:
+        return None
+    remaining = max(0, total - s1)
+    return {"eta_sec": remaining / rate, "rate_per_sec": rate,
+            "cur": s1, "total": total}
 
 
 # ----------------------------- 渲染 -----------------------------

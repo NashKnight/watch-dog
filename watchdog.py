@@ -412,7 +412,6 @@ def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
             rep.freshness_sec = now - mtime
             rep.start_ts = rep.start_ts or os.path.getctime(logp)
             rep.elapsed_sec = (now - rep.start_ts) if rep.start_ts else None
-            rep.status = S_STALLED if rep.freshness_sec > stall else S_RUNNING
             prog = _scan_log_progress(logp, extra.get("progress_regex"))
             if prog:
                 rep.step, rep.max_steps = prog
@@ -428,6 +427,20 @@ def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
                         else:
                             spi = 1 / est["rate_per_sec"] if est["rate_per_sec"] else 0
                             rep.speed_desc = f"{spi:.0f} 秒/项 (~{est['rate_per_sec']*3600:.0f} 项/时)"
+            # 状态判定: 先看是否已完成(进度打满 或 日志有 done 标记),
+            # 否则再按新鲜度判 Stalled/Running。评测跑完后进度脚本会退出、
+            # 日志停更, 必须先识别完成, 否则会被误判成 Stalled 发假告警。
+            done = (rep.step is not None and rep.max_steps and rep.step >= rep.max_steps) \
+                or _log_has_done_marker(logp)
+            if done:
+                rep.status = S_COMPLETED
+                rep.eta_sec = None
+                if rep.step is not None and rep.max_steps:
+                    rep.pct = 1.0 if rep.step >= rep.max_steps else rep.pct
+            elif rep.freshness_sec > stall:
+                rep.status = S_STALLED
+            else:
+                rep.status = S_RUNNING
         else:
             rep.note = f"日志文件不存在: {logp}"
 
@@ -516,6 +529,22 @@ def _scan_log_progress(path: str, regex: Optional[str]) -> Optional[tuple]:
 
 
 _LOG_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+
+# 通用任务的"完成"标记(旁路进度脚本收尾会打印 `eval done`)。
+_DONE_MARKER_RE = re.compile(r"\b(eval done|all done|完成|finished|done:)\b", re.IGNORECASE)
+
+
+def _log_has_done_marker(path: str) -> bool:
+    """扫描日志尾部是否有完成标记(如 eval_progress_tracker.sh 收尾的 `eval done`)。"""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return False
+    return bool(_DONE_MARKER_RE.search(tail))
 
 
 def _scan_log_eta(path: str, regex: Optional[str]) -> Optional[dict]:
@@ -646,9 +675,17 @@ def handle_notifications(rep: JobReport, notifier: FeishuNotifier, report_interv
         started = True
         last_report = now
     elif rep.status == S_COMPLETED:
+        # 完成后仍持续跟踪播报: 首次发"已完成", 之后按 report_interval 复播,
+        # 保证不会"悄悄成功退出", 用户随时能看到它还在完成态。若之前处于异常,
+        # 也在这里翻正。任务不想再收播报时用 `watchdog rm <job>` 移出监控表。
+        kind_word = "评测" if rep.kind == "generic" else "训练"
         if not completed:
-            notifier.send(title, "✅ 训练已完成。\n\n" + body, level="ok")
+            notifier.send(title, f"✅ {kind_word}已完成。\n\n" + body, level="ok")
             completed = True
+            last_report = now
+        elif (now - last_report) >= report_interval:
+            notifier.send(title, f"✅ {kind_word}已完成(持续跟踪中)。\n\n" + body, level="ok")
+            last_report = now
         incident = None
     elif rep.status in ABNORMAL:
         if incident != rep.status:

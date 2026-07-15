@@ -1,6 +1,8 @@
-# Train Watchdog
+# Watchdog
 
 一个常驻进程读一张监控表(`watchlist.txt`,每行 `<job_id> <名字>`),自动监控每个 job 的状态与进度,异常/进度都发飞书。播报标题为 `watchdog播报：任务 <id>（<名字>）`。
+
+根目录只保留公共能力；不同日志格式必须放入 `template/`，不再把任务专用 tracker 放在根目录。
 
 ## Quickstart
 
@@ -66,5 +68,25 @@ python watchdog.py rm 141369      # 移除
 watchdog.py   # 守护进程 + CLI + 统一 JobReport + 状态机
 tb_reader.py  # TensorBoard event 增量解析
 notifier.py   # 飞书卡片
-config.json   watchlist.txt   jobs_extra.json   state/   status.md   （运行时产物, 已 gitignore）
+template/
+  train/      # TensorBoard 模型训练的标准用法
+  eval/       # result.json 推理/评测 tracker
+  temp/       # SWW/TTS/一次性任务模板（gitignore，复制后本地定制）
 ```
+
+`config.json`、`watchlist.txt`、`jobs_extra.json`、`state/`、`status.md` 等均是运行时/用户数据，已 gitignore。
+
+### 模板与日志约定
+
+- 模型训练：见 [`template/train/`](template/train/README.md)，由 TensorBoard 自动发现，无需另写 tracker。
+- 推理评测：见 [`template/eval/`](template/eval/README.md)，可直接使用 `progress_tracker.sh`。
+- 其他日志格式：复制到 `template/temp/` 后定制；不得在根目录新增任务专用脚本。
+
+通用日志解析要求每条进度行只有一个 `X/Y`，例如：
+
+```text
+2026-07-15 09:00:00 eval progress: 120/500
+2026-07-15 09:30:00 eval done: 500/500
+```
+
+分支明细必须改写成 `done of total`，或另起一行，避免被通用解析器误识别为总进度。日志 mtime 应反映真实业务写盘，不能仅由 tracker 的定时心跳刷新。

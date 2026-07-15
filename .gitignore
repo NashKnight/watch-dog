@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 
+# 任务专用/一次性模板：本机可复制定制，但绝不提交。
+template/temp/
+
 # 运行时/用户数据
 config.json
 watchlist.txt

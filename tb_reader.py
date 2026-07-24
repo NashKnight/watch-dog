@@ -25,16 +25,30 @@ from tensorboard.compat.proto import event_pb2  # type: ignore
 
 
 # 训练脚本记录到 TB 的关键标量 (见 all_config.json: log_tts_loss / enable_distill 等)
-LOSS_TAGS = ["Loss/train", "Loss/ce", "Loss/kl", "Loss/tts_loss"]
+# Megatron omni 常用: loss/total loss / loss/lm loss / loss/tts loss
+LOSS_TAGS = [
+    "Loss/train", "Loss/ce", "Loss/kl", "Loss/tts_loss",
+    "loss/total loss", "loss/lm loss", "loss/tts loss", "loss/mtp loss",
+]
 
 
-def find_latest_event_file(tb_dir: str) -> Optional[str]:
-    """返回 tb_dir (可含子目录) 下最新的 events.out.tfevents.* 文件。"""
+def find_latest_event_file(tb_dir: str, job_id: Optional[str] = None) -> Optional[str]:
+    """返回 tb_dir (可含子目录) 下最新的 events.out.tfevents.* 文件。
+
+    若给了 ``job_id``, 优先只认路径/文件名里带该 id 的 event
+    (Megatron 常见 ``pytorchjob-megatron-run-<id>-worker-...``),
+    避免同一 TENSORBOARD_DIR 被多次重跑时读到旧 job 的进度。
+    """
     if not tb_dir or not os.path.isdir(tb_dir):
         return None
     candidates = glob.glob(os.path.join(tb_dir, "**", "events.out.tfevents.*"), recursive=True)
     candidates += glob.glob(os.path.join(tb_dir, "events.out.tfevents.*"))
     candidates = list(set(candidates))
+    if job_id:
+        jid = str(job_id)
+        filtered = [p for p in candidates if jid in os.path.basename(p) or f"job_{jid}" in p or f"job-{jid}" in p]
+        # 有匹配才收窄; 没有则先返回 None (排队/刚启动尚未落盘), 不回退到旧 job
+        candidates = filtered
     if not candidates:
         return None
     candidates.sort(key=lambda p: os.path.getmtime(p))
@@ -71,6 +85,7 @@ class TBTailer:
     """增量跟踪单个 TB run 的进度。跨轮次复用同一个实例即可。"""
 
     tb_dir: str
+    job_id: Optional[str] = None
     max_step_window: int = 200  # 保留最近 N 个 (wall, step) 采样用于估算速度
 
     # 内部状态
@@ -91,7 +106,7 @@ class TBTailer:
 
     def poll(self) -> bool:
         """读取新增事件, 更新指标。返回是否成功拿到 (至少一个) event 文件。"""
-        path = find_latest_event_file(self.tb_dir)
+        path = find_latest_event_file(self.tb_dir, job_id=self.job_id)
         if path is None:
             return False
         if path != self.event_file:

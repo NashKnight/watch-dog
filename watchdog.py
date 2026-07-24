@@ -297,6 +297,7 @@ class JobReport:
     start_ts: Optional[float] = None
     elapsed_sec: Optional[float] = None
     freshness_sec: Optional[float] = None
+    latest_update_at: Optional[str] = None
     note: str = ""
 
 
@@ -372,8 +373,8 @@ def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
 
         if tb_dir:
             tailer = tailers.get(job_id)
-            if tailer is None or tailer.tb_dir != tb_dir:
-                tailer = TBTailer(tb_dir=tb_dir)
+            if tailer is None or tailer.tb_dir != tb_dir or getattr(tailer, "job_id", None) != job_id:
+                tailer = TBTailer(tb_dir=tb_dir, job_id=job_id)
                 tailers[job_id] = tailer
             try:
                 tailer.poll()
@@ -410,14 +411,27 @@ def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
         if os.path.exists(logp):
             mtime = os.path.getmtime(logp)
             rep.freshness_sec = now - mtime
+            rep.latest_update_at = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
             rep.start_ts = rep.start_ts or os.path.getctime(logp)
             rep.elapsed_sec = (now - rep.start_ts) if rep.start_ts else None
-            prog = _scan_log_progress(logp, extra.get("progress_regex"))
+            is_stage1_dialogue = extra.get("preset") in {"stage1", "stage1_dialogue_generation"}
+            is_tts_audio = extra.get("preset") in {"tts", "tts_audio_generation", "stage2_tts_generation", "stage2_tts"}
+            if is_stage1_dialogue:
+                prog = _scan_stage1_progress(logp, extra)
+            elif is_tts_audio:
+                prog = _scan_tts_progress(logp)
+            else:
+                prog = _scan_log_progress(logp, extra.get("progress_regex"))
             if prog:
                 rep.step, rep.max_steps = prog
                 rep.pct = (rep.step / rep.max_steps) if rep.max_steps else None
                 if rep.max_steps and rep.step < rep.max_steps:
-                    est = _scan_log_eta(logp, extra.get("progress_regex"))
+                    # 先试日志内时间戳(旁路进度脚本), 没有时间戳(如 stage1)再退回
+                    # 用 watchdog 自己的轮询历史 events.jsonl 估算。
+                    est = _scan_log_eta(logp, extra.get("progress_regex")) \
+                        or _estimate_rate_from_events(job_id, rep.step, rep.max_steps)
+                    if not est and is_stage1_dialogue:
+                        est = _estimate_stage1_rate_from_files(logp, rep.step, rep.max_steps)
                     if est:
                         rep.eta_sec = est["eta_sec"]
                         rep.finish_at = (datetime.now() + timedelta(seconds=est["eta_sec"])).strftime("%m-%d %H:%M")
@@ -427,11 +441,27 @@ def build_report(job_id: str, name: str, cfg: dict, tailers: dict, now: float,
                         else:
                             spi = 1 / est["rate_per_sec"] if est["rate_per_sec"] else 0
                             rep.speed_desc = f"{spi:.0f} 秒/项 (~{est['rate_per_sec']*3600:.0f} 项/时)"
+            # 阶段标记(数据合成 stage1 对话生成: 现在到哪一步)。
+            if is_stage1_dialogue:
+                rep.phase = _scan_stage1_phase(logp, extra)
+            elif is_tts_audio:
+                rep.phase = _scan_tts_phase(logp)
+            # 通用阶段行: 任务自定义 phase_regex(第1捕获组=阶段文本), 用于旁路
+            # 进度脚本直接把"当前阶段/分支明细"写进日志给 watchdog 展示。
+            if not rep.phase and extra.get("phase_regex"):
+                rep.phase = _scan_last_capture(logp, extra.get("phase_regex"))
             # 状态判定: 先看是否已完成(进度打满 或 日志有 done 标记),
             # 否则再按新鲜度判 Stalled/Running。评测跑完后进度脚本会退出、
             # 日志停更, 必须先识别完成, 否则会被误判成 Stalled 发假告警。
-            done = (rep.step is not None and rep.max_steps and rep.step >= rep.max_steps) \
-                or _log_has_done_marker(logp)
+            # 注意: 有 done_regex 时以它为准(stage1 只认 PIPELINE DONE); 进度打满
+            # 不算完成 —— stage1 达标后还有 materialize/viz, 且中途某轮 accepted=A/A
+            # 是单轮比值不是总进度。
+            done_marker = _log_has_done_marker(logp, extra.get("done_regex"))
+            if extra.get("done_regex"):
+                done = done_marker
+            else:
+                done = (rep.step is not None and rep.max_steps and rep.step >= rep.max_steps) \
+                    or done_marker
             if done:
                 rep.status = S_COMPLETED
                 rep.eta_sec = None
@@ -513,7 +543,9 @@ def _scan_log_progress(path: str, regex: Optional[str]) -> Optional[tuple]:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - 8192))
+            # 读较大尾部: 数据合成 stage1 每轮的 `have X/target` 进度行会被成百上千条
+            # `+ uid ...` 生成行推离文件末尾, 窗口太小会时有时无。
+            f.seek(max(0, size - 262144))
             tail = f.read().decode("utf-8", "replace")
     except Exception:
         return None
@@ -528,14 +560,163 @@ def _scan_log_progress(path: str, regex: Optional[str]) -> Optional[tuple]:
     return last
 
 
+def _scan_last_capture(path: str, regex: Optional[str]) -> Optional[str]:
+    """从日志尾部返回最后一次匹配 ``regex`` 的第 1 个捕获组(通用阶段行用)。"""
+    if not regex:
+        return None
+    try:
+        pat = re.compile(regex)
+    except re.error:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 262144))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    last = None
+    for m in pat.finditer(tail):
+        last = m.group(1) if m.groups() else m.group(0)
+    return last.strip() if last else None
+
+
+def _read_stage1_log(path: str) -> str:
+    """Read stage1 logs for progress parsing.
+
+    Stage1 logs can push the initial ``[round ... generating N]`` line far away
+    from the tail with thousands of ``+ uid`` rows. For this preset, scan the
+    whole log so generation/verify progress remains accurate.
+    """
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+def _latest_stage1_round(data: str) -> tuple[Optional[re.Match], int]:
+    last = None
+    for m in re.finditer(r"\[round (\d+)/(\d+)\]\s+have\s+(\d+)/(\d+),\s+generating\s+(\d+)\s+window", data):
+        last = m
+    return last, (last.start() if last else 0)
+
+
+def _stage1_round_outcome_count(text: str) -> int:
+    """Count finished per-window rows in generation logs (success + failure)."""
+    raw = len(re.findall(r"(?m)^\s*[+x]\s+\S+", text))
+    json_msg = len(re.findall(r'"Message":"\s*[+x]\s+\S+', text))
+    return raw + json_msg
+
+
+def _scan_stage1_progress(path: str, extra: Optional[dict] = None) -> Optional[tuple]:
+    """Progress for stage1 dialogue-generation logs.
+
+    During the run, use the latest ``have X/target`` line. After completion the
+    log may only contain ``event_narration: N final annotations`` and
+    ``PIPELINE DONE``; in that case, reuse the last target and report ``N/target``.
+    """
+    try:
+        data = _read_stage1_log(path)
+    except Exception:
+        return None
+    extra = extra or {}
+    have_matches = list(re.finditer(r"have (\d+)/(\d+)", data))
+    target = int(have_matches[-1].group(2)) if have_matches else None
+    final_matches = list(re.finditer(r"event_narration:\s*(\d+)\s+final annotations", data))
+    if "PIPELINE DONE" in data and final_matches:
+        final_n = int(final_matches[-1].group(1))
+        return final_n, target or final_n
+
+    fill_matches = list(re.finditer(r"\[fill\].*?accepted\s+(\d+)(?:/(\d+)|\s+new)", data))
+    if fill_matches:
+        done = int(fill_matches[-1].group(1))
+        total = int(fill_matches[-1].group(2) or extra.get("stage1_target") or target or done)
+        return done, total
+
+    verify_total_matches = list(re.finditer(r"Stage 1 verify.*?\n\s*dialogues:\s+(\d+)", data, re.S))
+    if verify_total_matches:
+        total = int(verify_total_matches[-1].group(1))
+        vpos = verify_total_matches[-1].start()
+        checked = len(re.findall(r"(?m)^\s*[+x]\s+\S+:", data[vpos:]))
+        if checked:
+            return min(checked, total), total
+
+    round_m, round_pos = _latest_stage1_round(data)
+    gen_total_matches = list(re.finditer(r"Generate\s+\S+:\s+units=(\d+)", data))
+    windows_matches = list(re.finditer(r"^\s*windows:\s+(\d+)\s*$", data, re.M))
+    if gen_total_matches:
+        gen_total = int(gen_total_matches[-1].group(1))
+    elif round_m:
+        gen_total = int(round_m.group(5))
+    elif windows_matches:
+        gen_total = int(windows_matches[-1].group(1))
+    else:
+        gen_total = int(extra.get("stage1_generate_units") or 0)
+    if gen_total:
+        generated = _stage1_round_outcome_count(data[round_pos:])
+        return min(generated, gen_total), gen_total
+
+    if have_matches:
+        return int(have_matches[-1].group(1)), int(have_matches[-1].group(2))
+    return None
+
+
+def _scan_tts_progress(path: str) -> Optional[tuple]:
+    """Progress for OmniPro Stage2 TTS logs.
+
+    counting/generate_audio.py prints:
+      [tts] N samples from ...
+      [tts] clip-total N (chattts=... cosyvoice=...)
+      [tts-clip] + chattts/cosyvoice <key> ...
+      [tts]  + <uid>  user=... ai=... turns
+      [tts] done: synthesized N samples ...
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    total_matches = list(re.finditer(r"\[tts\]\s+(\d+)\s+samples\s+from\b", data))
+    sample_total_matches = list(re.finditer(r"\[tts\]\s+sample-total\s+(\d+)\b", data))
+    clip_total_matches = list(re.finditer(r"\[tts\]\s+clip-total\s+(\d+)\b", data))
+    done_matches = list(re.finditer(r"\[tts\]\s+done:\s+synthesized\s+(\d+)\s+samples", data))
+    item_done = len(re.findall(r"(?m)^\[tts\]\s+\+\s+", data))
+    clip_done = len(re.findall(r"(?m)^\[tts-clip\]\s+[+.]\s+", data))
+    if done_matches:
+        done = int(done_matches[-1].group(1))
+        total = int(sample_total_matches[-1].group(1)) if sample_total_matches else (int(total_matches[-1].group(1)) if total_matches else done)
+        return done, max(total, done)
+    if clip_total_matches:
+        clip_total = int(clip_total_matches[-1].group(1))
+        if clip_done < clip_total:
+            return min(clip_done, clip_total), clip_total
+        sample_total = int(sample_total_matches[-1].group(1)) if sample_total_matches else (int(total_matches[-1].group(1)) if total_matches else item_done)
+        if sample_total:
+            return min(item_done, sample_total), sample_total
+    if total_matches:
+        total = int(total_matches[-1].group(1))
+        return min(item_done, total), total
+    return None
+
+
 _LOG_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
 
 # 通用任务的"完成"标记(旁路进度脚本收尾会打印 `eval done`)。
-_DONE_MARKER_RE = re.compile(r"\b(eval done|all done|完成|finished|done:)\b", re.IGNORECASE)
+# 注意: 不要用裸 `done:` —— 很多流水线每一步都打印 `Step N done:`(如数据合成
+# stage1 的 `Step 2 done` / `Step 3 done`), 会导致刚跑第一轮就被误判为已完成。
+# 只认真正的"整个任务结束"标记。
+_DONE_MARKER_RE = re.compile(
+    r"(eval done|all done|pipeline done|finished|全部完成|任务完成|流水线完成|完成\s*$)",
+    re.IGNORECASE,
+)
 
 
-def _log_has_done_marker(path: str) -> bool:
-    """扫描日志尾部是否有完成标记(如 eval_progress_tracker.sh 收尾的 `eval done`)。"""
+def _log_has_done_marker(path: str, regex: Optional[str] = None) -> bool:
+    """扫描日志尾部是否有完成标记。
+
+    ``regex`` 为 per-job 自定义完成标记(如数据合成 stage1 的 ``PIPELINE DONE``);
+    不传则用全局 ``_DONE_MARKER_RE``。
+    """
+    pat = re.compile(regex, re.IGNORECASE) if regex else _DONE_MARKER_RE
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -544,7 +725,7 @@ def _log_has_done_marker(path: str) -> bool:
             tail = f.read().decode("utf-8", "replace")
     except Exception:
         return False
-    return bool(_DONE_MARKER_RE.search(tail))
+    return bool(pat.search(tail))
 
 
 def _scan_log_eta(path: str, regex: Optional[str]) -> Optional[dict]:
@@ -593,6 +774,202 @@ def _scan_log_eta(path: str, regex: Optional[str]) -> Optional[dict]:
             "cur": s1, "total": total}
 
 
+def _estimate_rate_from_events(job_id: str, cur_step: int, max_steps: int,
+                               window_sec: float = 7200.0) -> Optional[dict]:
+    """当日志行本身没有时间戳时(如数据合成 stage1), 用 watchdog 自己每轮写入
+    ``events.jsonl`` 的历史 (time + step) 估算速率与 ETA。
+
+    读取该 job 最近 ``window_sec`` 内的采样点, rate = Δstep/Δwall。
+    """
+    try:
+        with open(EVENTS, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 262144))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    points = []  # (epoch, step)
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line or f'"{job_id}"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if str(rec.get("job")) != str(job_id) or rec.get("step") is None:
+            continue
+        tm = _LOG_TS_RE.search(rec.get("time", ""))
+        if not tm:
+            continue
+        try:
+            ts = datetime.strptime(f"{tm.group(1)} {tm.group(2)}", "%Y-%m-%d %H:%M:%S").timestamp()
+            points.append((ts, int(rec["step"])))
+        except Exception:
+            continue
+    points.append((now_ts(), cur_step))
+    if not points:
+        return None
+    now_t = points[-1][0]
+    points = [p for p in points if now_t - p[0] <= window_sec]
+    # 只保留自本轮 run 起(step 单调不减)的连续段, 避免跨 run 重置污染
+    mono = [points[0]]
+    for t, s in points[1:]:
+        if s >= mono[-1][1]:
+            mono.append((t, s))
+        else:
+            mono = [(t, s)]
+    if len(mono) < 2:
+        return None
+    t0, s0 = mono[0]
+    t1, s1 = mono[-1]
+    if t1 <= t0 or s1 <= s0:
+        return None
+    rate = (s1 - s0) / (t1 - t0)
+    if rate <= 0:
+        return None
+    remaining = max(0, max_steps - cur_step)
+    return {"eta_sec": remaining / rate, "rate_per_sec": rate}
+
+
+def _estimate_stage1_rate_from_files(path: str, cur_step: int, max_steps: int) -> Optional[dict]:
+    """Estimate Stage1 generation speed from generated dialogue file mtimes.
+
+    This is a cold-start fallback before watchdog has enough polling history.
+    It only applies during generation, where ``output: .../generated/rN`` exists
+    and per-window JSONs are materialized under ``*/dialogues/*.json``.
+    """
+    try:
+        data = _read_stage1_log(path)
+    except Exception:
+        return None
+    outputs = re.findall(r"(?m)^\s*output:\s+(.*/generated/r\d+)\s*$", data)
+    if not outputs:
+        return None
+    root = Path(outputs[-1])
+    if not root.is_absolute():
+        root = Path(path).parent / root
+    if not root.exists():
+        return None
+    files = list(root.glob("*/dialogues/*.json"))
+    if len(files) < 2:
+        return None
+    first = min(p.stat().st_mtime for p in files)
+    last = max(p.stat().st_mtime for p in files)
+    elapsed = max(1.0, last - first)
+    rate = max(float(cur_step), float(len(files))) / elapsed
+    if rate <= 0:
+        return None
+    remaining = max(0, max_steps - cur_step)
+    return {"eta_sec": remaining / rate, "rate_per_sec": rate}
+
+
+# 数据合成 stage1 的阶段标记: prepare → stage0 → 第R轮(生成/校验) → 收尾 → 完成。
+_ROUND_RE = re.compile(r"\[round (\d+)/(\d+)\]")
+
+
+def _scan_stage1_phase(path: str, extra: Optional[dict] = None) -> Optional[str]:
+    """从数据合成 stage1 日志尾部推断"现在到哪一步", 便于播报。"""
+    try:
+        tail = _read_stage1_log(path)
+    except Exception:
+        return None
+    extra = extra or {}
+    if not tail:
+        return None
+    if "PIPELINE DONE" in tail:
+        return "完成"
+    fill_matches = list(re.finditer(r"\[fill\].*?accepted\s+(\d+)(?:/(\d+)|\s+new)", tail))
+    if fill_matches:
+        acc = fill_matches[-1].group(1)
+        target = fill_matches[-1].group(2) or extra.get("stage1_target") or "?"
+        return f"已达标, 收尾(materialize/viz) · accepted {acc}/{target}"
+    rounds = _ROUND_RE.findall(tail)
+    rnd = f"第{rounds[-1][0]}/{rounds[-1][1]}轮" if rounds else None
+    gen_total_matches = list(re.finditer(r"Generate\s+(\S+):\s+units=(\d+)", tail))
+    verify_total_matches = list(re.finditer(r"Stage 1 verify.*?\n\s*dialogues:\s+(\d+)", tail, re.S))
+    if verify_total_matches:
+        total = int(verify_total_matches[-1].group(1))
+        vpos = verify_total_matches[-1].start()
+        checked = len(re.findall(r"(?m)^\s*[+x]\s+\S+:", tail[vpos:]))
+        return f"{rnd or '第1/1轮'} · 校验中 · checked {min(checked, total)}/{total}"
+    if gen_total_matches:
+        task, total = gen_total_matches[-1].groups()
+        generated = len(re.findall(r"(?:^|Message\":\"|\\n)\s*[+x]\s+\S+", tail))
+        return f"{rnd or '第1/1轮'} · 生成中 · {task} generated {min(generated, int(total))}/{total}"
+
+    round_m, round_pos = _latest_stage1_round(tail)
+    windows_matches = list(re.finditer(r"^\s*windows:\s+(\d+)\s*$", tail, re.M))
+    if round_m:
+        gen_total = int(round_m.group(5))
+    elif windows_matches:
+        gen_total = int(windows_matches[-1].group(1))
+    else:
+        gen_total = int(extra.get("stage1_generate_units") or 0)
+    if gen_total:
+        generated = _stage1_round_outcome_count(tail[round_pos:])
+        if generated:
+            return f"{rnd or '第1/1轮'} · 生成中 · generated {min(generated, gen_total)}/{gen_total}"
+    # 找最靠后的子步标记
+    last_fill = tail.rfind("[fill]")
+    last_gen = max(tail.rfind("Step 2:"), tail.rfind("generate "))
+    last_ver = max(tail.rfind("Step 3:"), tail.rfind("verify "))
+    if last_fill >= 0 and last_fill > max(last_gen, last_ver):
+        return "已达标, 收尾(materialize/viz)"
+    sub = None
+    if last_ver >= 0 or last_gen >= 0:
+        sub = "校验中" if last_ver >= last_gen else "生成中"
+    if rnd and sub:
+        return f"{rnd} · {sub}"
+    if rnd:
+        return rnd
+    if "[stage0]" in tail:
+        return "stage0 切片规划"
+    if "[prepare]" in tail:
+        return "prepare 准备标注"
+    return None
+
+
+def _scan_tts_phase(path: str) -> Optional[str]:
+    """Infer current phase from OmniPro Stage2 TTS log."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 262144))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    clip_total = None
+    clip_total_matches = list(re.finditer(r"\[tts\]\s+clip-total\s+(\d+)\b", tail))
+    if clip_total_matches:
+        clip_total = int(clip_total_matches[-1].group(1))
+    clip_done = len(re.findall(r"(?m)^\[tts-clip\]\s+[+.]\s+", tail))
+    sample_total = None
+    sample_total_matches = list(re.finditer(r"\[tts\]\s+sample-total\s+(\d+)\b", tail))
+    if sample_total_matches:
+        sample_total = int(sample_total_matches[-1].group(1))
+    sample_done = len(re.findall(r"(?m)^\[tts\]\s+\+\s+", tail))
+    if "[viz] wrote" in tail:
+        return "完成并已重建可视化"
+    if "[tts] done:" in tail:
+        return "完成"
+    if clip_total and clip_done < clip_total:
+        return f"合成 TTS clips {clip_done}/{clip_total}"
+    if sample_total and sample_done:
+        return f"写入整段 user/ai 音轨 {sample_done}/{sample_total}"
+    if "CosyVoice2(ai): synth" in tail:
+        return "合成中文 AI CosyVoice clips"
+    if "ChatTTS: synth" in tail:
+        return "合成 ChatTTS clips"
+    if re.search(r"(?m)^\[tts\]\s+\+\s+", tail):
+        return "写入整段 user/ai 音轨"
+    if re.search(r"\[tts\]\s+\d+\s+samples\s+from\b", tail):
+        return "准备 TTS 样本"
+    return None
+
+
 # ----------------------------- 渲染 -----------------------------
 
 def render_card(rep: JobReport) -> str:
@@ -616,7 +993,8 @@ def render_card(rep: JobReport) -> str:
 
     # 进度
     if rep.step is not None and rep.max_steps:
-        lines.append(f"**进度**: {rep.step}/{rep.max_steps} ({rep.pct*100:.1f}%)\n`{progress_bar(rep.pct or 0)}`")
+        unit = "条" if rep.kind == "generic" else ""
+        lines.append(f"**进度**: {rep.step}/{rep.max_steps}{unit} ({rep.pct*100:.1f}%)\n`{progress_bar(rep.pct or 0)}`")
         if rep.phase:
             lines.append(f"**阶段**: {rep.phase}")
         if rep.next_save_step:
@@ -625,6 +1003,9 @@ def render_card(rep: JobReport) -> str:
         if rep.speed_desc:
             lines.append(f"**速度**: {rep.speed_desc}")
 
+    # 阶段(通用任务在没有 X/Y 进度时也应能看到"到哪一步")
+    if rep.phase and not (rep.step is not None and rep.max_steps):
+        lines.append(f"**阶段**: {rep.phase}")
     if rep.elapsed_sec is not None:
         lines.append(f"**已运行**: {fmt_duration(rep.elapsed_sec)}")
     if rep.eta_sec is not None and rep.status != S_COMPLETED:
@@ -635,6 +1016,8 @@ def render_card(rep: JobReport) -> str:
         lines.append(f"**Loss**: {loss_str}")
     if rep.freshness_sec is not None:
         lines.append(f"**数据更新**: {fmt_duration(rep.freshness_sec)}前")
+    if rep.latest_update_at:
+        lines.append(f"**最后日志写入**: {rep.latest_update_at}")
     lines.append(f"**检查时间**: {now_str()}")
     if rep.note:
         lines.append(f"> {rep.note}")
@@ -854,8 +1237,37 @@ def cmd_add(args: argparse.Namespace) -> None:
         else:
             print(f"[{job_id}] 未能从命令里解析出日志路径, 请改用 --log 手动指定。")
 
-    # 记录高级配置(日志路径/手动 config/命令)
-    if log_path or args.config or args.cmd:
+    # preset: 一键套用某类任务的解析规则, 统一口径。
+    #   stage1_dialogue_generation = omnipro 数据合成 stage1
+    #     (prepare→stage0→generate→verify/refine→materialize/viz):
+    #     进度取 `have X/target`(已接受/目标), 完成只认 `PIPELINE DONE`,
+    #     并展示 prepare/stage0/第R轮·生成或校验/收尾 的阶段。
+    #   stage1 是旧兼容别名。
+    #   stage2_tts_generation / tts_audio_generation = OmniPro Stage2 TTS:
+    #     合成阶段进度取 `[tts] clip-total ...` + 每条 `[tts-clip] + ...`,
+    #     写盘阶段进度取 `[tts] sample-total ...` + 每条 `[tts] + uid`,
+    #     纯 TTS 完成认 `[tts] done:`；若 entry 串联可视化，可覆盖 done_regex。
+    preset = getattr(args, "preset", None)
+    stage1_dialogue_generation = {
+        "preset": "stage1_dialogue_generation",
+        "progress_regex": r"have (\d+)/(\d+)",
+        "done_regex": r"PIPELINE DONE",
+    }
+    stage2_tts_generation = {
+        "preset": "tts_audio_generation",
+        "done_regex": r"\[tts\] done:",
+    }
+    preset_defaults = {
+        "stage1_dialogue_generation": stage1_dialogue_generation,
+        "stage1": stage1_dialogue_generation,
+        "stage2_tts_generation": stage2_tts_generation,
+        "stage2_tts": stage2_tts_generation,
+        "tts_audio_generation": stage2_tts_generation,
+        "tts": stage2_tts_generation,
+    }
+
+    # 记录高级配置(日志路径/手动 config/命令/preset)
+    if log_path or args.config or args.cmd or preset:
         extra = load_extra()
         e = extra.get(job_id, {})
         if log_path:
@@ -864,6 +1276,12 @@ def cmd_add(args: argparse.Namespace) -> None:
             e["config"] = args.config
         if args.cmd:
             e["cmd"] = args.cmd
+        if preset:
+            if preset not in preset_defaults:
+                print(f"[{job_id}] 未知 preset='{preset}', 可选: {', '.join(preset_defaults)}")
+            else:
+                e.update(preset_defaults[preset])
+                print(f"[{job_id}] 已套用 preset='{preset}'")
         extra[job_id] = e
         save_extra(extra)
 
@@ -1002,6 +1420,9 @@ def main() -> int:
     p_add.add_argument("name", nargs="*", help="任务名字(可选, 缺省用启动时间)")
     p_add.add_argument("--log", help="通用任务的日志文件路径(非训练任务用)")
     p_add.add_argument("--cmd", help="完整启动命令(自动从中抽取日志路径, 非训练任务用)")
+    p_add.add_argument("--preset", help="任务类型预设, 统一解析规则。可选: "
+                       "stage1_dialogue_generation/stage1, "
+                       "stage2_tts_generation/stage2_tts/tts_audio_generation/tts")
     p_add.add_argument("--config", help="手动指定 all_config.json")
     p_add.set_defaults(func=cmd_add)
 

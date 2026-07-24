@@ -82,6 +82,20 @@ template/
 - 推理评测：见 [`template/eval/`](template/eval/README.md)，可直接使用 `progress_tracker.sh`。
 - 其他日志格式：复制到 `template/temp/` 后定制；不得在根目录新增任务专用脚本。
 
+#### omnipro 数据合成 stage1（preset=stage1，统一口径）
+
+`counting / step_inst / narration / alert` 四条流水线的 stage1 日志格式一致，用 `--preset stage1` 加监控即可，**不要**依赖裸 `X/Y` 通用解析（日志里 `Step 2 done` / `Step 3 done: accepted=A/A` 等中间比值会被误当总进度、误判「已完成」）：
+
+```bash
+python watchdog.py add <job_id> <名字> --preset stage1 --log <stage1日志绝对路径>
+```
+
+preset=stage1 的口径：
+- **进度** = 最新 `have X/target`（已接受样本 / 目标条数），非单轮 `accepted=A/B`；
+- **完成** = 只认 `PIPELINE DONE`（达到 target 后还有 materialize/viz，进度打满不算完成）；
+- **阶段** = prepare 准备标注 / stage0 切片规划 / 第R轮·生成或校验 / 收尾 / 完成；
+- **ETA** = stage1 日志无行级时间戳，改用 watchdog 轮询历史 `events.jsonl` 的 (time, 已接受) 估速。
+
 通用日志解析要求每条进度行只有一个 `X/Y`，例如：
 
 ```text
